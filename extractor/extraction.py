@@ -122,6 +122,23 @@ Start directly with [ and end with ].
 </output_format>
 """
 
+EXTRACTION_PROMPT_GPT_OSS = """You are a customs invoice data extractor. Extract every line item from the invoice and return a JSON array.
+
+Output: ONLY a valid JSON array starting with [ and ending with ]. No markdown, no explanation, nothing outside the array.
+
+Rules:
+1. LANGUAGE: Prefer Russian descriptions. In bilingual documents (Russian + English sections), extract ONLY the Russian description. In monolingual documents, keep text exactly as written.
+2. HS CODE: Copy verbatim, never truncate or add digits. If two codes exist for the same item, always prefer the longer one.
+3. HEADER DATA: The additional_context block contains the document header. Apply document_number, document_date, country_sender, currency_code, and currency_name from that header to EVERY item in the output.
+4. COST: If unit price (cost) is missing, calculate it as price / quantity.
+5. UNIT: Default to "pcs" if not specified. Allowed values: kg, pcs, l, set, m.
+6. COUNTRY: country_origin must be a 2-letter ISO code (e.g. DE, CN, RU). Use "Неизвестно" if unknown. country_origin_code is the numeric ISO country code.
+
+Required fields for each item (use null if not found):
+description, hs_code, quantity, unit, cost, price, currency_code, currency_name,
+document_date, document_number, country_origin, country_origin_code, country_sender
+"""
+
 # Few-shot examples that teach LangExtract the schema shape.
 #
 # Example 1 — BILINGUAL invoice (RU + EN sections).
@@ -664,13 +681,12 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 # Edit this dict to add/rename profiles. Keys are the strings callers can pass
-# in the POST body as {"model": "fast"}.  Values are the actual model IDs sent
+# in the POST body as {"model": "gpt-oss"}.  Values are the actual model IDs sent
 # to LangExtract.  You can also pass a raw model ID directly (e.g.
-# "gemini-2.5-pro") — resolve_model_id() will use it verbatim.
+# "gemini-2.5-flash") — resolve_model_id() will use it verbatim.
 MODEL_PROFILES: dict[str, str] = {
-    "fast":    "gemini-2.0-flash",          # good quality, fastest Gemini
-    "quality": "gemini-2.5-pro",            # highest quality, slower
-    "glm":     "accounts/fireworks/models/glm-5",  # OpenAI-compat via Fireworks
+    "gpt-oss": "gpt-oss:120b",       # GPT-OSS 120B via Ollama cloud
+    "gemini":  "gemini-2.5-flash",   # Google Gemini 2.5 Flash (fallback)
 }
 
 
@@ -684,18 +700,17 @@ def resolve_model_id(model_spec: str | None) -> str:
       3. Raw model ID    → used verbatim (e.g. "gemini-2.5-flash-preview-04-17")
     """
     if not model_spec:
-        return getattr(settings, "LLM_MODEL_PRIMARY", "gemini-2.0-flash")
+        return getattr(settings, "LLM_MODEL_PRIMARY", "gpt-oss:120b")
     return MODEL_PROFILES.get(model_spec, model_spec)
 
 
 # ---------------------------------------------------------------------------
-# Provider resolution — Gemini, OpenAI, Fireworks, any OpenAI-compatible API
+# Provider resolution — Ollama cloud (gpt-oss) and Gemini
 # ---------------------------------------------------------------------------
 
-# OpenAI-compatible провайдеры: prefix → base_url
+# OpenAI-compatible providers: prefix → sentinel (actual URL resolved from settings at call time)
 _OPENAI_COMPATIBLE = {
-    "accounts/fireworks/": "https://api.fireworks.ai/inference/v1",
-    "openrouter/":         "https://openrouter.ai/api/v1",
+    "gpt-oss": "ollama",   # Ollama cloud — base_url from settings.OLLAMA_BASE_URL
 }
 
 
@@ -722,36 +737,25 @@ _register_openai_compatible_patterns()
 def _build_lx_config(model_id: str) -> lx_factory.ModelConfig:
     """
     Build a LangExtract ModelConfig:
-      - gemini-*             → Gemini  (LANGEXTRACT_API_KEY)
-      - gpt-*                → OpenAI  (LANGEXTRACT_API_KEY)
-      - accounts/fireworks/* → Fireworks AI (FIREWORKS_API_KEY) + base_url injected
+      - gpt-oss:* → Ollama cloud (OLLAMA_BASE_URL / OLLAMA_API_KEY)
+      - gemini-*  → Google Gemini (LANGEXTRACT_API_KEY)
     """
-    for prefix, base_url in _OPENAI_COMPATIBLE.items():
-        if model_id.startswith(prefix):
-            if "fireworks" in prefix:
-                api_key = (
-                    getattr(settings, "FIREWORKS_API_KEY", "")
-                    or getattr(settings, "LANGEXTRACT_API_KEY", "")
-                )
-            else:
-                api_key = getattr(settings, "LANGEXTRACT_API_KEY", "")
+    if model_id.startswith("gpt-oss"):
+        return lx_factory.ModelConfig(
+            model_id=model_id,
+            provider_kwargs={
+                "base_url":    getattr(settings, "OLLAMA_BASE_URL", "https://ollama.com/v1"),
+                "api_key":     getattr(settings, "OLLAMA_API_KEY", "ollama") or "ollama",
+                "max_workers": getattr(settings, "LLM_MAX_WORKERS_OLLAMA", 1),
+            },
+        )
 
-            return lx_factory.ModelConfig(
-                model_id=model_id,
-                provider_kwargs={
-                    "base_url": base_url,
-                    "api_key": api_key or None,
-                    "max_workers": getattr(settings, "LLM_MAX_WORKERS_OAI", 15),
-                },
-            )
-
-    # Gemini / native OpenAI — auto-resolved by router
-    api_key = getattr(settings, "LANGEXTRACT_API_KEY", "")
+    # Gemini — auto-resolved by router
     return lx_factory.ModelConfig(
         model_id=model_id,
         provider_kwargs={
-            "api_key": api_key or None,
-            "max_workers": getattr(settings, "LLM_MAX_WORKERS_GEMINI", 4),
+            "api_key":     getattr(settings, "LANGEXTRACT_API_KEY", "") or None,
+            "max_workers": getattr(settings, "LLM_MAX_WORKERS_GEMINI", 10),
         },
     )
 
@@ -769,22 +773,28 @@ def extract_with_langextract_optimized(
     Run LangExtract extraction and return (json_str, annotated_doc).
 
     Supports:
-      - gemini-*              → Google Gemini (LANGEXTRACT_API_KEY)
-      - gpt-*                 → OpenAI (OPENAI_API_KEY / LANGEXTRACT_API_KEY)
-      - accounts/fireworks/*  → Fireworks AI (FIREWORKS_API_KEY)
+      - gpt-oss:* → Ollama cloud (plain prompt, 30k char buffer, 1 worker)
+      - gemini-*  → Google Gemini (XML prompt, 4k char buffer, 10 workers)
 
     The second element is an ``lx.data.AnnotatedDocument``.
     """
     config = _build_lx_config(model_id)
 
+    if model_id.startswith("gpt-oss"):
+        prompt = EXTRACTION_PROMPT_GPT_OSS
+        buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER_OLLAMA", 30000)
+    else:
+        prompt = EXTRACTION_PROMPT
+        buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER", 4000)
+
     try:
         annotated_doc = lx.extract(
             text_or_documents=context_text,
-            prompt_description=EXTRACTION_PROMPT,
+            prompt_description=prompt,
             examples=EXAMPLES,
             config=config,
             additional_context=header_context or None,
-            max_char_buffer=getattr(settings, "LLM_MAX_CHAR_BUFFER", 2000),
+            max_char_buffer=buffer,
         )
     except Exception as exc:
         logger.warning("lx.extract() failed (%s: %s) — returning empty result", type(exc).__name__, exc)

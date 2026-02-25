@@ -59,18 +59,21 @@ else:
     }
 
 # LangExtract / LLM configuration
-LANGEXTRACT_API_KEY = os.environ.get("LANGEXTRACT_API_KEY", "")   # Gemini / default
-FIREWORKS_API_KEY   = os.environ.get("FIREWORKS_API_KEY",   "")   # Fireworks AI
-LLM_MODEL_PRIMARY  = os.environ.get("LLM_MODEL_PRIMARY",  "gemini-2.0-flash")
-LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.0-flash")
+LANGEXTRACT_API_KEY = os.environ.get("LANGEXTRACT_API_KEY", "")   # Gemini API key
+LLM_MODEL_PRIMARY  = os.environ.get("LLM_MODEL_PRIMARY",  "gpt-oss")
+LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.5-flash")
 
-# LangExtract performance tuning
-# max_char_buffer: chars per chunk sent to LLM — larger = fewer chunks = faster, but higher per-call cost
-# max_workers_oai: parallel workers for Fireworks / OpenAI-compatible providers
-# max_workers_gemini: parallel workers for native Gemini (keep low to avoid rate limits)
-LLM_MAX_CHAR_BUFFER    = int(os.environ.get("LLM_MAX_CHAR_BUFFER",    "2000"))
-LLM_MAX_WORKERS_OAI    = int(os.environ.get("LLM_MAX_WORKERS_OAI",    "15"))
-LLM_MAX_WORKERS_GEMINI = int(os.environ.get("LLM_MAX_WORKERS_GEMINI", "4"))
+# Ollama cloud configuration (primary model: gpt-oss:120b)
+OLLAMA_BASE_URL            = os.environ.get("OLLAMA_BASE_URL",            "https://ollama.com/v1")
+OLLAMA_API_KEY             = os.environ.get("OLLAMA_API_KEY",             "ollama")
+LLM_MAX_WORKERS_OLLAMA     = int(os.environ.get("LLM_MAX_WORKERS_OLLAMA",     "1"))
+LLM_MAX_CHAR_BUFFER_OLLAMA = int(os.environ.get("LLM_MAX_CHAR_BUFFER_OLLAMA", "30000"))
+
+# Gemini performance tuning (fallback model)
+# max_char_buffer: chars per chunk — smaller keeps Gemini within rate limits
+# max_workers_gemini: parallel chunk workers
+LLM_MAX_CHAR_BUFFER    = int(os.environ.get("LLM_MAX_CHAR_BUFFER",    "4000"))
+LLM_MAX_WORKERS_GEMINI = int(os.environ.get("LLM_MAX_WORKERS_GEMINI", "10"))
 
 # Currency database — JSON string loaded from env (matches CURRENCY_DB_JSON in original workflow)
 CURRENCY_DB_JSON = os.environ.get("CURRENCY_DB_JSON", "[]")
