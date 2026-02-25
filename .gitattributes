@@ -1,0 +1,11 @@
+# Normalize line endings to LF in repository, CRLF on checkout on Windows
+* text=auto eol=lf
+
+# Binaries — never touch line endings
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
