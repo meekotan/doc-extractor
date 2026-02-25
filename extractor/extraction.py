@@ -304,18 +304,19 @@ def post_fill_from_header(items: list[dict], header_meta: dict,
 def deduplicate_items(items: list[dict]) -> list[dict]:
     """
     Remove duplicate invoice rows that arise when an OCR document contains
-    the same goods in multiple languages / sections (e.g. a Russian table
-    followed by an English packing list).
+    the same goods in multiple sections (e.g. RU table + EN customs table +
+    RU packing list — all three repeat the same items).
 
-    Strategy — single pass by exact key (price, quantity, cost).
-    Using only these three numeric fields is intentional: two different items
-    can legitimately share the same price and quantity (e.g. two different
-    carbon tubes at 29.60 EUR × 2 pcs), so cost must also match to be
-    considered a true duplicate.
+    Strategy — single pass by (normalized_description, price, quantity, cost).
 
-    The row that is kept is always the one with the most filled fields,
-    so we prefer the Russian description row (usually has hs_code) over
-    the bare English article-code row.
+    Adding the normalized description to the key makes deduplication safe for
+    two conflicting cases:
+    - Bilingual invoice with repeated sections: each item appears 2-3× with
+      IDENTICAL Russian descriptions and identical numerics → correctly merged.
+    - Dense invoice (e.g. 217 items): different items that happen to share the
+      same price/qty/cost have DIFFERENT descriptions → NOT merged → all preserved.
+
+    The row that is kept is always the one with the most filled fields (richer row).
     """
     if not items:
         return items
@@ -326,6 +327,13 @@ def deduplicate_items(items: list[dict]) -> list[dict]:
         except (TypeError, ValueError):
             return -1.0
 
+    def _normalize_description(desc: str) -> str:
+        """Lowercase, strip punctuation, collapse whitespace."""
+        s = str(desc or "").lower()
+        s = re.sub(r'[^\w]', ' ', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+
     def _filled_count(item: dict) -> int:
         """Count non-empty fields — used to prefer the richer row."""
         return sum(
@@ -333,19 +341,20 @@ def deduplicate_items(items: list[dict]) -> list[dict]:
             if v is not None and str(v).strip().lower() not in ("", "null", "none", "0")
         )
 
-    # --- Pass 1: exact dedup by (price, quantity, cost) ---
+    # --- Pass 1: dedup by (normalized_description, price, quantity, cost) ---
     seen_exact: dict[tuple, int] = {}   # key → index in result list
     result: list[dict] = []
 
     for item in items:
         key = (
+            _normalize_description(item.get("description", "")),
             _numeric(item.get("price")),
             _numeric(item.get("quantity"), 3),
             _numeric(item.get("cost")),
         )
-        # Skip rows where all three values are zero/missing — they are
-        # likely header lines that slipped through validation.
-        if key == (-1.0, -1.0, -1.0) or key == (0.0, 0.0, 0.0):
+        # Skip rows where all numeric values are zero/missing — likely
+        # header lines that slipped through validation.
+        if key[1:] == (-1.0, -1.0, -1.0) or key[1:] == (0.0, 0.0, 0.0):
             result.append(item)
             continue
 
@@ -358,10 +367,6 @@ def deduplicate_items(items: list[dict]) -> list[dict]:
             seen_exact[key] = len(result)
             result.append(item)
 
-    # Pass 2 (soft dedup by price+quantity only) was removed — too aggressive.
-    # Different items can legitimately share the same price and quantity
-    # (e.g. two different carbon tubes both costing 29.6 EUR × 2 pcs).
-    # Pass 1 (price + quantity + cost) is sufficient for real duplicates.
     return result
 
 
@@ -585,6 +590,11 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
             if unit is None or str(unit).strip().lower() in ("", "null", "none"):
                 item["unit"] = "pcs"
         final_items = finalize_items(items, currency_db)
+        # Remove cross-section duplicates (bilingual invoices repeat items in
+        # RU + EN + packing-list sections). Safe for dense invoices too because
+        # the key includes normalized description — different items with the
+        # same price/qty/cost are NOT merged.
+        final_items = deduplicate_items(final_items)
     m.t_finalize_s = t[0]
 
     m.items_extracted = len(final_items)
