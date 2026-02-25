@@ -523,10 +523,12 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
     # Resolve which model to use for this run
     primary_model = resolve_model_id(model_id)
     fallback_model = getattr(settings, "LLM_MODEL_FALLBACK", "gemini-2.0-flash")
+    # Tracks the model that actually produced the accepted result
+    effective_model = primary_model
 
     if not context:
         m.t_total_s = time.perf_counter() - t_wall_start
-        return {"error": "Empty OCR text", "metrics": m.to_dict(), "model_id": primary_model}
+        return {"error": "Empty OCR text", "metrics": m.to_dict(), "model_id": effective_model}
 
     # Extract header for additional_context injection into every chunk
     header_context = extract_header(context)
@@ -551,6 +553,7 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
     # Step 4 – fallback если primary не справился
     if not validation["is_valid"]:
         m.fallback_used = True
+        effective_model = fallback_model   # fallback is now the active model
         with timer() as t:
             raw_output, annotated_doc = _extract(fallback_model)
         m.t_fallback_llm_s = t[0]
@@ -565,7 +568,7 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
         return {
             "error": validation.get("error", "Extraction failed after fallback"),
             "metrics": m.to_dict(),
-            "model_id": primary_model,
+            "model_id": effective_model,
         }
 
     # Step 5 – currency resolution & finalisation
@@ -605,7 +608,7 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
         "result": {"items": final_items, "count": len(final_items)},
         "metrics": m.to_dict(),
         "annotated_doc": annotated_doc,   # lx.data.AnnotatedDocument — for visualizer
-        "model_id": primary_model,
+        "model_id": effective_model,
     }
 
 
