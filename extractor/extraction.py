@@ -122,11 +122,19 @@ Start directly with [ and end with ].
 </output_format>
 """
 
-# Few-shot example that teaches LangExtract the schema shape.
+# Few-shot examples that teach LangExtract the schema shape.
+#
+# Example 1 — BILINGUAL invoice (RU + EN sections).
+#   Rule: prefer Russian description; prefer the LONGER hs_code (RU section
+#   often has 10-digit, EN section 8-digit — but length varies per document).
+#
+# Example 2 — MONOLINGUAL ENGLISH invoice.
+#   Rule: keep English description as-is; hs_code may be any valid length
+#   (4, 6, 8, or 10 digits) — copy verbatim, never truncate or extend.
 EXAMPLES = [
     lx.data.ExampleData(
-        # Bilingual invoice example: RU section first, EN section second.
-        # Shows GLM-5 exactly which fields to take from which section.
+        # BILINGUAL invoice: RU section first, EN customs section second.
+        # Demonstrates: pick Russian description, pick longer hs_code.
         text=(
             "=== CURRENCY DATABASE (REFERENCE) ===\n"
             '[{"code":"EUR","name":"Euro"}]\n\n'
@@ -143,12 +151,12 @@ EXAMPLES = [
         extractions=[
             lx.data.Extraction(
                 extraction_class="invoice_item",
-                # extraction_text must be the Russian description
+                # Bilingual: extraction_text = Russian description
                 extraction_text="Ноутбук Dell XPS",
                 attributes={
-                    # hs_code: 10-digit from RU section, NOT 8-digit from EN section
+                    # Prefer the longer 10-digit RU code over the 8-digit EN code
                     "hs_code": "8471309900",
-                    # description: Russian text, NOT English
+                    # Bilingual: use Russian description, not English
                     "description": "Ноутбук Dell XPS",
                     "quantity": 2,
                     "unit": "pcs",
@@ -158,14 +166,52 @@ EXAMPLES = [
                     "currency_name": "Euro",
                     "document_date": "10/01/2025",
                     "document_number": "INV-001",
-                    # country_origin: ISO-2 code taken from EN "Co. of Origin" column
+                    # country_origin: ISO-2 from EN "Co. of Origin" column
                     "country_origin": "DE",
                     "country_origin_code": 276,
                     "country_sender": "Germany",
                 },
             )
         ],
-    )
+    ),
+    lx.data.ExampleData(
+        # MONOLINGUAL ENGLISH invoice — no Russian section present.
+        # Demonstrates: keep English description as-is; hs_code may be
+        # 8 digits (or any valid length) — copy verbatim, do not extend.
+        text=(
+            "=== CURRENCY DATABASE (REFERENCE) ===\n"
+            '[{"code":"USD","name":"US Dollar"}]\n\n'
+            "=== INVOICE CONTENT ===\n"
+            "Commercial Invoice No. CI-2024-089  Date: 05/03/2024\n"
+            "Shipper: TechParts Inc., United States\n\n"
+            "No. | Description            | HS Code  | Qty | Unit price | Total\n"
+            "1   | Industrial servo motor | 85016100 |  5  | 125.00     | 625.00\n"
+        ),
+        extractions=[
+            lx.data.Extraction(
+                extraction_class="invoice_item",
+                # Monolingual EN: extraction_text = English description
+                extraction_text="Industrial servo motor",
+                attributes={
+                    # 8-digit hs_code — valid length, must NOT be extended to 10
+                    "hs_code": "85016100",
+                    # Monolingual EN: keep English description as-is
+                    "description": "Industrial servo motor",
+                    "quantity": 5,
+                    "unit": "pcs",
+                    "cost": 125.00,
+                    "price": 625.00,
+                    "currency_code": "USD",
+                    "currency_name": "US Dollar",
+                    "document_date": "05/03/2024",
+                    "document_number": "CI-2024-089",
+                    "country_origin": "Неизвестно",
+                    "country_origin_code": None,
+                    "country_sender": "United States",
+                },
+            )
+        ],
+    ),
 ]
 
 # ---------------------------------------------------------------------------
