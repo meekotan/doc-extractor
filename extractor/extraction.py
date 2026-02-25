@@ -694,7 +694,7 @@ def _build_lx_config(model_id: str) -> lx_factory.ModelConfig:
                 provider_kwargs={
                     "base_url": base_url,
                     "api_key": api_key or None,
-                    "max_workers": 15,
+                    "max_workers": getattr(settings, "LLM_MAX_WORKERS_OAI", 15),
                 },
             )
 
@@ -704,7 +704,7 @@ def _build_lx_config(model_id: str) -> lx_factory.ModelConfig:
         model_id=model_id,
         provider_kwargs={
             "api_key": api_key or None,
-            "max_workers": 4,
+            "max_workers": getattr(settings, "LLM_MAX_WORKERS_GEMINI", 4),
         },
     )
 
@@ -737,7 +737,7 @@ def extract_with_langextract_optimized(
             examples=EXAMPLES,
             config=config,
             additional_context=header_context or None,
-            max_char_buffer=2000,
+            max_char_buffer=getattr(settings, "LLM_MAX_CHAR_BUFFER", 2000),
         )
     except Exception as exc:
         logger.warning("lx.extract() failed (%s: %s) — returning empty result", type(exc).__name__, exc)

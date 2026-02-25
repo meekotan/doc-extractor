@@ -64,6 +64,14 @@ FIREWORKS_API_KEY   = os.environ.get("FIREWORKS_API_KEY",   "")   # Fireworks AI
 LLM_MODEL_PRIMARY  = os.environ.get("LLM_MODEL_PRIMARY",  "gemini-2.0-flash")
 LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.0-flash")
 
+# LangExtract performance tuning
+# max_char_buffer: chars per chunk sent to LLM — larger = fewer chunks = faster, but higher per-call cost
+# max_workers_oai: parallel workers for Fireworks / OpenAI-compatible providers
+# max_workers_gemini: parallel workers for native Gemini (keep low to avoid rate limits)
+LLM_MAX_CHAR_BUFFER    = int(os.environ.get("LLM_MAX_CHAR_BUFFER",    "2000"))
+LLM_MAX_WORKERS_OAI    = int(os.environ.get("LLM_MAX_WORKERS_OAI",    "15"))
+LLM_MAX_WORKERS_GEMINI = int(os.environ.get("LLM_MAX_WORKERS_GEMINI", "4"))
+
 # Currency database — JSON string loaded from env (matches CURRENCY_DB_JSON in original workflow)
 CURRENCY_DB_JSON = os.environ.get("CURRENCY_DB_JSON", "[]")
 
