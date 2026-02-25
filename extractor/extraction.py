@@ -250,7 +250,8 @@ _PRICE_RE          = re.compile(r'\b\d+[.,]\d{2}\b')
 # контекст структуры колонок без утечки самих товарных позиций.
 _TABLE_HEADER_RE = re.compile(
     r'\b(?:наименование|кол[-.\s]?во|количество|стоимость|ед[.\s]?изм'
-    r'|unit\b|qty\b|quantity\b|amount\b|description\b|тн\s*вэд|hs\s*code)',
+    r'|unit\b|qty\b|quantity\b|amount\b|description\b|тн\s*вэд|hs\s*code'
+    r'|product\b|item\b|total\b|value\b|price\b|count\b|rate\b)',
     re.IGNORECASE,
 )
 
