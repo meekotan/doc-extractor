@@ -4,15 +4,14 @@ Invoice extraction service for document code 04021.
 Translates the original Dify workflow branch into Python using LangExtract:
 
   Node 1765260281035  →  clean_text()
-  Node 1765260372029  →  extract_with_langextract()   (primary: Gemini)
+  Node 1765260372029  →  extract_with_langextract()   (primary: GPT-OSS 120B)
   Node 1765260722411  →  validate_and_parse()
   Node 1765342175106  →  currency.finalize_items()
-  Node 1765261045587  →  extract_with_langextract()   (fallback: GPT-4o)
+  Node 1765261045587  →  extract_with_langextract()   (fallback: Gemini 2.5 Flash)
 
 Optimisations over original Dify implementation:
   - extract_header()      → pulls top 25 lines of OCR as shared context
   - additional_context    → header injected into EVERY LangExtract chunk
-  - max_char_buffer=4000  → fewer chunks = fewer API calls = faster
   - post_fill_from_header → fills empty metadata fields from parsed header
   - deduplicate_items()   → removes duplicate rows from bilingual invoices
                             (RU description + EN packing list → same item twice)
@@ -22,38 +21,15 @@ import json
 import logging
 import re
 import time
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-from pydantic import BaseModel
+import langextract as lx
+from langextract import factory as lx_factory
+from django.conf import settings
 
-# json5 / demjson3 не нужны — используем ручную чистку через regex
-
-
-# ---------------------------------------------------------------------------
-# Pydantic schema for Gemini native structured output
-# ---------------------------------------------------------------------------
-
-class InvoiceItem(BaseModel):
-    hs_code: Optional[str] = None
-    description: str
-    quantity: Optional[float] = None
-    unit: Optional[str] = None
-    cost: Optional[float] = None
-    price: Optional[float] = None
-    currency_code: Optional[str] = None
-    currency_name: Optional[str] = None
-    document_date: Optional[str] = None
-    document_number: Optional[str] = None
-    country_origin: Optional[str] = None
-    country_origin_code: Optional[int] = None
-    country_sender: Optional[str] = None
-    suggestions: Optional[List] = None
-
-
-class InvoiceExtraction(BaseModel):
-    items: List[InvoiceItem]
+from .currency import build_currency_db_string, finalize_items, load_currency_db
+from .metrics import RunMetrics, compute_field_fill_rates, timer
 
 
 def _repair_json(text: str) -> str:
@@ -83,60 +59,119 @@ from .metrics import RunMetrics, compute_field_fill_rates, timer
 # ---------------------------------------------------------------------------
 
 EXTRACTION_PROMPT = """
-<role>
-You are a highly precise Data Extractor for Customs Invoices. Your mission is to mirror the document's data into JSON with zero information loss.
-</role>
-
-<language_logic>
-- PRIMARY LANGUAGE: Russian.
-- BILINGUAL DATA: If a description is provided in both English and Russian, extract ONLY the Russian version.
-- MONOLINGUAL DATA: If the text is only in Russian or only in English, extract it exactly as written.
-- NO TRUNCATION: Capture the full technical description. Do not summarize.
-</language_logic>
-
-<hs_code_rules>
-- VERBATIM COPY: Extract the HS Code (ТН ВЭД) exactly as it appears in the document.
-- NO TRUNCATION: Do not remove any digits. If the code is 4, 6, 8, or 10 digits long, copy every single digit.
-- PRIORITY: If you see a short code (e.g., in the EN section) and a longer code (e.g., in the RU section) for the same item, ALWAYS prefer the longer version.
-</hs_code_rules>
-
-<field_specifications>
-- description: Full technical name (Priority: Russian text if available).
-- hs_code: Verbatim string of digits. Do not truncate, do not add digits.
-- unit: Mandatory. Standardize: kg, pcs, l, set, m. (Default: "pcs").
-- quantity: Numeric (use "." as decimal separator).
-- cost: Unit price. If missing, calculate: price / quantity.
-- price: Total row price.
-- country_origin: 2-letter ISO code (e.g., DE, NL, RU). If not found, "Неизвестно".
-- currency: From DOCUMENT HEADER (additional_context).
-</field_specifications>
-
-<orchestration_data>
-Using the "additional_context" (DOCUMENT HEADER), apply "document_number", "document_date", and "country_sender" to EVERY item in the resulting JSON array.
-</orchestration_data>
-
-<output_format>
-Return ONLY a valid JSON array of objects. 
-No markdown fences (```json), no preamble. 
-Start directly with [ and end with ].
-</output_format>
+# ROLE
+You are a specialized agent for high-precision extraction of customs invoice data (TN VED/EAEU standards). Your goal is to produce a JSON output that mirrors the document content with 100% fidelity.
+# CORE EXTRACTION LOGIC
+1. **Language Priority**:
+   - Primary: Russian (RU).
+   - If a line item has both RU and EN descriptions, extract ONLY the Russian text.
+   - If only one language is present (RU or EN), extract it exactly as is.
+   - DO NOT translate. DO NOT truncate. Capture full technical strings.
+2. **HS Codes (ТН ВЭД) Handling**:
+   - **Verbatim Extraction**: Copy digits exactly. No spaces, no dots.
+   - **Length Priority**: If you find two versions of a code for one item (e.g., 6-digit and 10-digit), ALWAYS pick the longest one.
+   - **No Modification**: Never add or remove digits. If the code is 4, 6, 8, or 10 digits, keep it as is.
+3. **Data Integrity**:
+   - Extract every single row that has a price.
+   - Do not merge similar rows. Do not skip any items.
+# FIELD SPECIFICATIONS
+- `description`: Full Russian name (priority) or English name. No summarization.
+- `hs_code`: String of digits. Verbatim copy.
+- `unit`: Standardize to: kg, pcs, l, set, m. (Default to "pcs" if missing).
+- `quantity`: Numeric value (use "." decimal separator).
+- `cost`: Price per unit. If not explicit, calculate: `price` / `quantity`.
+- `price`: Total row price.
+- `country_origin`: 2-letter ISO code (DE, NL, CN, RU). If missing, use "Неизвестно".
+- `country_origin_code`: Numeric ISO country code (e.g., 276 for DE, 156 for CN). If missing, use null.
+- `currency_code`: 3-letter ISO code from DOCUMENT HEADER in `additional_context` (e.g., "USD", "EUR").
+- `currency_name`: Full currency name from DOCUMENT HEADER in `additional_context` (e.g., "US Dollar", "Euro").
+# GLOBAL DOCUMENT CONTEXT
+From the `additional_context` (DOCUMENT HEADER), you MUST apply these values to EVERY item in the JSON array:
+- `document_number`
+- `document_date`
+- `country_sender`
+- `currency_code`
+- `currency_name`
+# OUTPUT FORMATTING
+- Return ONLY a raw JSON array of objects.
+- Do not include markdown code blocks (```json).
+- No preamble, no post-text, no explanations.
+- Start with `[` and end with `]`.
 """
 
-EXTRACTION_PROMPT_GPT_OSS = """You are a customs invoice data extractor. Extract every line item from the invoice and return a JSON array.
-
-Output: ONLY a valid JSON array starting with [ and ending with ]. No markdown, no explanation, nothing outside the array.
-
-Rules:
-1. LANGUAGE: Prefer Russian descriptions. In bilingual documents (Russian + English sections), extract ONLY the Russian description. In monolingual documents, keep text exactly as written.
-2. HS CODE: Copy verbatim, never truncate or add digits. If two codes exist for the same item, always prefer the longer one.
-3. HEADER DATA: The additional_context block contains the document header. Apply document_number, document_date, country_sender, currency_code, and currency_name from that header to EVERY item in the output.
-4. COST: If unit price (cost) is missing, calculate it as price / quantity.
-5. UNIT: Default to "pcs" if not specified. Allowed values: kg, pcs, l, set, m.
-6. COUNTRY: country_origin must be a 2-letter ISO code (e.g. DE, CN, RU). Use "Неизвестно" if unknown. country_origin_code is the numeric ISO country code.
-
-Required fields for each item (use null if not found):
-description, hs_code, quantity, unit, cost, price, currency_code, currency_name,
-document_date, document_number, country_origin, country_origin_code, country_sender
+EXTRACTION_PROMPT_GPT_OSS = """
+ROLE:
+You are a deterministic customs invoice line-item extractor.
+TASK:
+Extract ALL line items from the provided invoice text and return them as a JSON array.
+OUTPUT REQUIREMENTS (STRICT):
+- Output ONLY valid JSON.
+- Output MUST start with "[" and end with "]".
+- No markdown.
+- No explanations.
+- No comments.
+- No trailing text.
+- If no items are found, return [].
+EXTRACTION RULES:
+1. LANGUAGE PRIORITY
+   - Prefer Russian descriptions.
+   - If the document contains both Russian and English sections for the same item, extract ONLY the Russian description.
+   - If the document is monolingual, preserve the original language exactly as written.
+2. HS CODE
+   - Copy exactly as written.
+   - Do NOT truncate.
+   - Do NOT normalize.
+   - Do NOT add digits.
+   - If multiple HS codes exist for one item, select the longest one.
+3. HEADER DATA (GLOBAL CONTEXT)
+   The block "additional_context" contains header-level data.
+   The following fields MUST be copied to EVERY extracted item:
+   - document_number
+   - document_date
+   - country_sender
+   - currency_code
+   - currency_name
+4. COST CALCULATION
+   - If unit cost is missing but total price and quantity are present:
+     cost = price / quantity
+   - If calculation is impossible, use null.
+   - Do NOT guess values.
+5. UNIT NORMALIZATION
+   - If unit is missing, default to "pcs".
+   - Allowed values ONLY:
+     kg, pcs, l, set, m
+   - Normalize variations (e.g., "шт." → "pcs", "кг" → "kg").
+6. COUNTRY OF ORIGIN
+   - country_origin must be a 2-letter ISO code (e.g., DE, CN, RU).
+   - If unknown, use "Неизвестно".
+   - country_origin_code must be the numeric ISO country code.
+   - If unknown, use null.
+   - Do NOT invent country data.
+OUTPUT SCHEMA (REQUIRED KEYS FOR EACH ITEM):
+Use null if a field cannot be determined.
+[
+  {
+    "description": string,
+    "hs_code": string | null,
+    "quantity": number | null,
+    "unit": string | null,
+    "cost": number | null,
+    "price": number | null,
+    "currency_code": string | null,
+    "currency_name": string | null,
+    "document_date": string | null,
+    "document_number": string | null,
+    "country_origin": string,
+    "country_origin_code": number | null,
+    "country_sender": string | null
+  }
+]
+IMPORTANT:
+- Extract EVERY line item.
+- One JSON object per line item.
+- No deduplication.
+- No merging of separate rows.
+- No additional fields beyond the schema.
 """
 
 # Few-shot examples that teach LangExtract the schema shape.
@@ -565,7 +600,7 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
     Args:
         ocr_draft:  Raw OCR text from the invoice.
         model_id:   Optional model override.  Accepts a profile alias ("gpt-oss",
-                    "gemini") or any raw model ID string.  When None,
+                    "cerebras", "gemini") or any raw model ID string.  When None,
                     falls back to LLM_MODEL_PRIMARY from Django settings.
                     The fallback model always comes from LLM_MODEL_FALLBACK.
 
@@ -686,8 +721,9 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
 # to LangExtract.  You can also pass a raw model ID directly (e.g.
 # "gemini-2.5-flash") — resolve_model_id() will use it verbatim.
 MODEL_PROFILES: dict[str, str] = {
-    "gpt-oss": "gpt-oss:120b",       # GPT-OSS 120B via Ollama cloud
-    "gemini":  "gemini-2.5-flash",   # Google Gemini 2.5 Flash (fallback)
+    "gpt-oss":   "gpt-oss:120b",     # GPT-OSS 120B via Ollama cloud
+    "cerebras":  "gpt-oss-120b",     # GPT-OSS 120B via Cerebras (3k tok/s)
+    "gemini":    "gemini-2.5-flash", # Google Gemini 2.5 Flash (fallback)
 }
 
 
@@ -738,18 +774,32 @@ _register_openai_compatible_patterns()
 def _build_lx_config(model_id: str) -> lx_factory.ModelConfig:
     """
     Build a LangExtract ModelConfig:
-      - gpt-oss:* → Ollama cloud (OLLAMA_BASE_URL / OLLAMA_API_KEY)
-      - gemini-*  → Google Gemini (LANGEXTRACT_API_KEY)
+      - gpt-oss:120b  → Ollama cloud   (OLLAMA_BASE_URL  / OLLAMA_API_KEY)
+      - gpt-oss-120b  → Cerebras cloud (CEREBRAS_BASE_URL / CEREBRAS_API_KEY)
+      - gemini-*      → Google Gemini  (LANGEXTRACT_API_KEY)
+
+    Distinction: Ollama model IDs use a colon tag (gpt-oss:120b);
+    Cerebras model IDs use a hyphen (gpt-oss-120b).
     """
     if model_id.startswith("gpt-oss"):
-        return lx_factory.ModelConfig(
-            model_id=model_id,
-            provider_kwargs={
-                "base_url":    getattr(settings, "OLLAMA_BASE_URL", "https://ollama.com/v1"),
-                "api_key":     getattr(settings, "OLLAMA_API_KEY", "ollama") or "ollama",
-                "max_workers": getattr(settings, "LLM_MAX_WORKERS_OLLAMA", 1),
-            },
-        )
+        if ":" in model_id:   # Ollama format: gpt-oss:120b
+            return lx_factory.ModelConfig(
+                model_id=model_id,
+                provider_kwargs={
+                    "base_url":    getattr(settings, "OLLAMA_BASE_URL", "https://ollama.com/v1"),
+                    "api_key":     getattr(settings, "OLLAMA_API_KEY", "ollama") or "ollama",
+                    "max_workers": getattr(settings, "LLM_MAX_WORKERS_OLLAMA", 1),
+                },
+            )
+        else:                  # Cerebras format: gpt-oss-120b
+            return lx_factory.ModelConfig(
+                model_id=model_id,
+                provider_kwargs={
+                    "base_url":    getattr(settings, "CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
+                    "api_key":     getattr(settings, "CEREBRAS_API_KEY", "") or None,
+                    "max_workers": getattr(settings, "LLM_MAX_WORKERS_CEREBRAS", 1),
+                },
+            )
 
     # Gemini — auto-resolved by router
     return lx_factory.ModelConfig(
@@ -774,8 +824,9 @@ def extract_with_langextract_optimized(
     Run LangExtract extraction and return (json_str, annotated_doc).
 
     Supports:
-      - gpt-oss:* → Ollama cloud (plain prompt, 30k char buffer, 1 worker)
-      - gemini-*  → Google Gemini (XML prompt, 4k char buffer, 10 workers)
+      - gpt-oss:120b → Ollama cloud  (plain prompt, 30k char buffer, 1 worker)
+      - gpt-oss-120b → Cerebras      (plain prompt, 30k char buffer, 1 worker)
+      - gemini-*     → Google Gemini (XML prompt,   4k char buffer, 10 workers)
 
     The second element is an ``lx.data.AnnotatedDocument``.
     """
