@@ -63,11 +63,19 @@ LANGEXTRACT_API_KEY = os.environ.get("LANGEXTRACT_API_KEY", "")   # Gemini API k
 LLM_MODEL_PRIMARY  = os.environ.get("LLM_MODEL_PRIMARY",  "gpt-oss")
 LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.5-flash")
 
-# Ollama cloud configuration (primary model: gpt-oss:120b)
+# Ollama cloud — GPT-OSS 120B (alias: "gpt-oss", raw: "gpt-oss:120b")
 OLLAMA_BASE_URL            = os.environ.get("OLLAMA_BASE_URL",            "https://ollama.com/v1")
 OLLAMA_API_KEY             = os.environ.get("OLLAMA_API_KEY",             "ollama")
 LLM_MAX_WORKERS_OLLAMA     = int(os.environ.get("LLM_MAX_WORKERS_OLLAMA",     "1"))
 LLM_MAX_CHAR_BUFFER_OLLAMA = int(os.environ.get("LLM_MAX_CHAR_BUFFER_OLLAMA", "30000"))
+
+# Cerebras cloud — GPT-OSS 120B (alias: "cerebras", raw: "gpt-oss-120b")
+# ~3000 tok/s, 131K context window. Get key at: cerebras.ai/openai
+CEREBRAS_BASE_URL            = os.environ.get("CEREBRAS_BASE_URL",            "https://api.cerebras.ai/v1")
+CEREBRAS_API_KEY             = os.environ.get("CEREBRAS_API_KEY",             "")
+LLM_MAX_WORKERS_CEREBRAS     = int(os.environ.get("LLM_MAX_WORKERS_CEREBRAS",     "1"))
+# 100 000 chars ≈ fits any invoice in one chunk (131K token window = ~500K chars)
+LLM_MAX_CHAR_BUFFER_CEREBRAS = int(os.environ.get("LLM_MAX_CHAR_BUFFER_CEREBRAS", "100000"))
 
 # Gemini performance tuning (fallback model)
 # max_char_buffer: chars per chunk — smaller keeps Gemini within rate limits

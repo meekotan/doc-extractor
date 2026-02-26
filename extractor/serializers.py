@@ -5,8 +5,8 @@ from .models import ExtractionJob
 class ExtractionRequestSerializer(serializers.Serializer):
     document_code = serializers.CharField()
     ocr_draft = serializers.CharField()
-    # Optional model override.  Accepts a profile alias ("gpt-oss", "gemini")
-    # or any raw model ID (e.g. "gpt-oss:120b", "gemini-2.5-flash").
+    # Optional model override.  Accepts a profile alias ("gpt-oss", "cerebras", "gemini")
+    # or any raw model ID (e.g. "gpt-oss:120b", "gpt-oss-120b", "gemini-2.5-flash").
     # When omitted, the pipeline uses LLM_MODEL_PRIMARY from settings.
     model = serializers.CharField(required=False, allow_blank=True, default="")
 

@@ -824,9 +824,9 @@ def extract_with_langextract_optimized(
     Run LangExtract extraction and return (json_str, annotated_doc).
 
     Supports:
-      - gpt-oss:120b → Ollama cloud  (plain prompt, 30k char buffer, 1 worker)
-      - gpt-oss-120b → Cerebras      (plain prompt, 30k char buffer, 1 worker)
-      - gemini-*     → Google Gemini (XML prompt,   4k char buffer, 10 workers)
+      - gpt-oss:120b → Ollama cloud  (plain prompt, 30k  char buffer, 1 worker)
+      - gpt-oss-120b → Cerebras      (plain prompt, 100k char buffer, 1 worker)
+      - gemini-*     → Google Gemini (XML prompt,   4k   char buffer, 10 workers)
 
     The second element is an ``lx.data.AnnotatedDocument``.
     """
@@ -834,7 +834,10 @@ def extract_with_langextract_optimized(
 
     if model_id.startswith("gpt-oss"):
         prompt = EXTRACTION_PROMPT_GPT_OSS
-        buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER_OLLAMA", 30000)
+        if ":" in model_id:   # Ollama: gpt-oss:120b  (unknown context window → 30k safe)
+            buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER_OLLAMA", 30000)
+        else:                  # Cerebras: gpt-oss-120b (131K ctx → 100k fits any invoice)
+            buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER_CEREBRAS", 100000)
     else:
         prompt = EXTRACTION_PROMPT
         buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER", 4000)

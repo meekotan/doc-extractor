@@ -21,9 +21,21 @@ def check_database() -> dict:
 
 
 def check_llm_api() -> dict:
-    """Check that a LangExtract API key is configured (non-empty, plausible length)."""
-    key = getattr(settings, "LANGEXTRACT_API_KEY", "")
-    model = getattr(settings, "LLM_MODEL_PRIMARY", "unknown")
+    """Check that the active primary model's API key is configured."""
+    from .extraction import MODEL_PROFILES
+    primary_spec  = getattr(settings, "LLM_MODEL_PRIMARY", "")
+    primary_model = MODEL_PROFILES.get(primary_spec, primary_spec)
+
+    if ":" in primary_model and primary_model.startswith("gpt-oss"):
+        key      = getattr(settings, "OLLAMA_API_KEY", "")
+        provider = "Ollama"
+    elif primary_model.startswith("gpt-oss-"):
+        key      = getattr(settings, "CEREBRAS_API_KEY", "")
+        provider = "Cerebras"
+    else:
+        key      = getattr(settings, "LANGEXTRACT_API_KEY", "")
+        provider = "Gemini"
+
     if key and len(key) > 10:
-        return {"status": "ok", "model": model}
-    return {"status": "error", "detail": "LANGEXTRACT_API_KEY not set or too short"}
+        return {"status": "ok", "model": primary_model, "provider": provider}
+    return {"status": "error", "detail": f"{provider} API key not configured", "model": primary_model}
