@@ -26,7 +26,7 @@ class ExtractionJob(models.Model):
     duration_ms = models.IntegerField(null=True, blank=True, help_text="Total wall-clock time in milliseconds")
     metrics = models.JSONField(null=True, blank=True, help_text="Per-step timing and accuracy metrics")
     # LLM model used for this extraction (primary model id or profile alias)
-    model_id = models.CharField(max_length=100, blank=True, default="", help_text="LLM model used for extraction (e.g. 'gemini-2.0-flash', 'fast', 'glm')")
+    model_id = models.CharField(max_length=100, blank=True, default="", help_text="LLM model used for extraction (e.g. 'gpt-oss:120b', 'gemini-2.5-flash')")
     # LangExtract visualizer data — serialized AnnotatedDocument dict
     viz_data = models.JSONField(null=True, blank=True, help_text="Serialized LangExtract AnnotatedDocument for the visualizer")
     created_at = models.DateTimeField(auto_now_add=True)

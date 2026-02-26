@@ -564,8 +564,8 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
 
     Args:
         ocr_draft:  Raw OCR text from the invoice.
-        model_id:   Optional model override.  Accepts a profile alias ("fast",
-                    "quality", "glm") or any raw model ID string.  When None,
+        model_id:   Optional model override.  Accepts a profile alias ("gpt-oss",
+                    "gemini") or any raw model ID string.  When None,
                     falls back to LLM_MODEL_PRIMARY from Django settings.
                     The fallback model always comes from LLM_MODEL_FALLBACK.
 
@@ -586,7 +586,8 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
 
     # Resolve which model to use for this run
     primary_model = resolve_model_id(model_id)
-    fallback_model = getattr(settings, "LLM_MODEL_FALLBACK", "gemini-2.0-flash")
+    _fb = getattr(settings, "LLM_MODEL_FALLBACK", "gemini-2.5-flash")
+    fallback_model = MODEL_PROFILES.get(_fb, _fb)
     # Tracks the model that actually produced the accepted result
     effective_model = primary_model
 
@@ -695,12 +696,13 @@ def resolve_model_id(model_spec: str | None) -> str:
     Resolve a model spec to a concrete model ID.
 
     Resolution order:
-      1. None / ""       → LLM_MODEL_PRIMARY from Django settings
+      1. None / ""       → LLM_MODEL_PRIMARY from Django settings (alias-resolved)
       2. Profile alias   → MODEL_PROFILES[model_spec]
-      3. Raw model ID    → used verbatim (e.g. "gemini-2.5-flash-preview-04-17")
+      3. Raw model ID    → used verbatim (e.g. "gpt-oss:120b", "gemini-2.5-flash")
     """
     if not model_spec:
-        return getattr(settings, "LLM_MODEL_PRIMARY", "gpt-oss:120b")
+        primary = getattr(settings, "LLM_MODEL_PRIMARY", "gpt-oss:120b")
+        return MODEL_PROFILES.get(primary, primary)
     return MODEL_PROFILES.get(model_spec, model_spec)
 
 
@@ -717,9 +719,8 @@ _OPENAI_COMPATIBLE = {
 def _register_openai_compatible_patterns() -> None:
     """
     Register OpenAI-compatible model prefixes into LangExtract's router so
-    model IDs like 'accounts/fireworks/models/glm-5' resolve to
-    OpenAILanguageModel automatically (priority 20 beats default 10).
-    Idempotent — router deduplicates entries.
+    model IDs like 'gpt-oss:120b' resolve to OpenAILanguageModel automatically
+    (priority 20 beats default 10). Idempotent — router deduplicates entries.
     """
     import langextract.providers as lx_providers
     from langextract.providers import router as lx_router
