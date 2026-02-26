@@ -77,8 +77,9 @@ from langextract.providers import router as lx_router
 from langextract.providers.openai import OpenAILanguageModel
 
 lx_providers.load_builtins_once()
-lx_router.register(r"^accounts\/fireworks\/", priority=20)(OpenAILanguageModel)
-# Then ModelConfig with provider_kwargs={"base_url": "https://api.fireworks.ai/inference/v1"}
+lx_router.register(r"^gpt-oss", priority=20)(OpenAILanguageModel)
+# Then ModelConfig with provider_kwargs={"base_url": "https://api.cerebras.ai/v1"}
+# Both Ollama (gpt-oss:120b) and Cerebras (gpt-oss-120b) use this same registration
 ```
 
 ---
@@ -207,10 +208,11 @@ return {"result": ..., "metrics": m.to_dict(), "annotated_doc": ...}
 
 ### Model config via Django settings
 ```python
-primary_model  = getattr(settings, "LLM_MODEL_PRIMARY",  "gemini-2.5-pro")
-fallback_model = getattr(settings, "LLM_MODEL_FALLBACK", "gemini-2.0-flash")
+# resolve_model_id() handles alias lookup through MODEL_PROFILES
+primary_model  = resolve_model_id(model_id)                      # e.g. "gpt-oss-120b"
+fallback_model = MODEL_PROFILES.get(settings.LLM_MODEL_FALLBACK, settings.LLM_MODEL_FALLBACK)
 ```
-Override in `.env` — no code change needed.
+Override `LLM_MODEL_PRIMARY` / `LLM_MODEL_FALLBACK` in `.env` — no code change needed.
 
 ---
 
@@ -237,13 +239,13 @@ provider_kwargs={"api_key": ..., "max_workers": 15}
 LangExtract sends chunks to the LLM in parallel. `max_workers=4` means 4 concurrent API calls. Raise to `8` if the LLM provider allows it and you have many chunks.
 
 ### Choose the right primary model
-| Model | Speed | Quality |
-|-------|-------|---------|
-| `gemini-2.0-flash` | fast | good for clean OCR |
-| `gemini-2.5-pro`   | slower | best for noisy/complex invoices |
-| `accounts/fireworks/models/glm-5` | very fast | experimental |
+| Alias | Model ID | Speed | Context | Best for |
+|-------|----------|-------|---------|----------|
+| `cerebras` | `gpt-oss-120b` | ~3 000 tok/s | 131K (100K chars) | Whole invoice in 1 request |
+| `gpt-oss`  | `gpt-oss:120b`  | cloud rate-limited | ~30K chars/chunk | Alternative when Cerebras unavailable |
+| `gemini`   | `gemini-2.5-flash` | moderate | 4K chars/chunk | Fallback; 10 parallel workers |
 
-**For large clean files:** use `gemini-2.0-flash` as primary, `gemini-2.5-pro` as fallback only.
+**For speed:** use `cerebras` as primary — 131K context fits any invoice in one API call (`LLM_MAX_CHAR_BUFFER_CEREBRAS=100000`). Fallback to `gemini`.
 
 ### Skip fallback for speed
 - Fallback doubles processing time if primary fails
@@ -271,18 +273,35 @@ The LLM call is 95%+ of total time. Optimize there first.
 
 ### `.env` keys
 ```
-LANGEXTRACT_API_KEY=...    # Gemini / OpenAI key
-FIREWORKS_API_KEY=...      # Fireworks AI (optional)
-LLM_MODEL_PRIMARY=gemini-2.0-flash
-LLM_MODEL_FALLBACK=gemini-2.5-pro
+# Model selection (aliases: cerebras, gpt-oss, gemini — or raw model IDs)
+LLM_MODEL_PRIMARY=cerebras
+LLM_MODEL_FALLBACK=gemini
+
+# Cerebras cloud (gpt-oss-120b, ~3000 tok/s)
+CEREBRAS_BASE_URL=https://api.cerebras.ai/v1
+CEREBRAS_API_KEY=...
+LLM_MAX_WORKERS_CEREBRAS=1
+LLM_MAX_CHAR_BUFFER_CEREBRAS=100000
+
+# Ollama cloud (gpt-oss:120b)
+OLLAMA_BASE_URL=https://ollama.com/v1
+OLLAMA_API_KEY=...
+LLM_MAX_WORKERS_OLLAMA=1
+LLM_MAX_CHAR_BUFFER_OLLAMA=30000
+
+# Gemini 2.5 Flash (fallback)
+LANGEXTRACT_API_KEY=...
+LLM_MAX_WORKERS_GEMINI=10
+LLM_MAX_CHAR_BUFFER=4000
+
 CURRENCY_DB_JSON=[{"code":"EUR","name":"Euro"}, ...]
 DATABASE_URL=postgresql://...   # omit → SQLite
 ```
 
 ### Adding a new model
-1. Add prefix to `_OPENAI_COMPATIBLE` in `extraction.py` if it's OpenAI-compatible
-2. Set `LLM_MODEL_PRIMARY` in `.env`
-3. No other code change needed — `_build_lx_config()` handles routing
+1. Add alias to `MODEL_PROFILES` in `extraction.py`
+2. Add a routing branch in `_build_lx_config()` if it needs custom base_url/api_key
+3. Set `LLM_MODEL_PRIMARY` in `.env` — no migrations needed
 
 ---
 
@@ -302,29 +321,35 @@ The `model` field is **optional** (omit → uses `LLM_MODEL_PRIMARY` from settin
 | `model` value | Resolves to |
 |---------------|-------------|
 | _(omitted / "")_ | `LLM_MODEL_PRIMARY` from `.env` |
-| `"fast"` | `gemini-2.0-flash` |
-| `"quality"` | `gemini-2.5-pro` |
-| `"glm"` | `accounts/fireworks/models/glm-5` |
+| `"cerebras"` | `gpt-oss-120b` (Cerebras cloud) |
+| `"gpt-oss"` | `gpt-oss:120b` (Ollama cloud) |
+| `"gemini"` | `gemini-2.5-flash` |
 | any raw model ID | used verbatim |
 
 ### Resolution chain (`extraction.py`)
 ```python
 MODEL_PROFILES: dict[str, str] = {
-    "fast":    "gemini-2.0-flash",
-    "quality": "gemini-2.5-pro",
-    "glm":     "accounts/fireworks/models/glm-5",
+    "gpt-oss":  "gpt-oss:120b",     # GPT-OSS 120B via Ollama cloud
+    "cerebras": "gpt-oss-120b",     # GPT-OSS 120B via Cerebras (3k tok/s)
+    "gemini":   "gemini-2.5-flash", # Google Gemini 2.5 Flash (fallback)
 }
 
 def resolve_model_id(model_spec: str | None) -> str:
     if not model_spec:
-        return getattr(settings, "LLM_MODEL_PRIMARY", "gemini-2.0-flash")
+        primary = getattr(settings, "LLM_MODEL_PRIMARY", "gpt-oss:120b")
+        return MODEL_PROFILES.get(primary, primary)
     return MODEL_PROFILES.get(model_spec, model_spec)
 ```
+
+### Provider routing (`_build_lx_config`)
+- `gpt-oss:120b` (colon) → Ollama branch (OLLAMA_BASE_URL, OLLAMA_API_KEY)
+- `gpt-oss-120b` (hyphen) → Cerebras branch (CEREBRAS_BASE_URL, CEREBRAS_API_KEY)
+- anything else → Gemini branch (LANGEXTRACT_API_KEY)
 
 ### Adding a new profile
 Edit `MODEL_PROFILES` in `extraction.py` — one line, no migrations needed:
 ```python
-MODEL_PROFILES["turbo"] = "accounts/fireworks/models/llama-3.1-70b-turbo"
+MODEL_PROFILES["my-alias"] = "actual-model-id"
 ```
 
 ### Tracking which model was used
@@ -341,7 +366,7 @@ The fallback is always `LLM_MODEL_FALLBACK` from `.env` — so you can pin a rel
 from extractor.extraction import run_invoice_extraction
 from extractor.models import ExtractionJob
 job = ExtractionJob.objects.get(pk=12)
-result = run_invoice_extraction(job.ocr_draft, model_id="quality")
+result = run_invoice_extraction(job.ocr_draft, model_id="gemini")
 print(result["model_id"], result["metrics"])
 ```
 

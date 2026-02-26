@@ -43,11 +43,27 @@ cp .env.example .env
 
 ```dotenv
 # .env
-LANGEXTRACT_API_KEY=your_gemini_or_openai_key
-FIREWORKS_API_KEY=your_fireworks_key          # optional, only for GLM-5
 
-LLM_MODEL_PRIMARY=gemini-2.0-flash            # default primary model
-LLM_MODEL_FALLBACK=gemini-2.5-pro             # fallback if primary fails
+# Primary: GPT-OSS 120B via Cerebras (~3 000 tok/s, 131K context)
+LLM_MODEL_PRIMARY=cerebras
+LLM_MODEL_FALLBACK=gemini
+
+# Cerebras cloud — get key at cerebras.ai/openai
+CEREBRAS_BASE_URL=https://api.cerebras.ai/v1
+CEREBRAS_API_KEY=your_cerebras_api_key_here
+LLM_MAX_WORKERS_CEREBRAS=1
+LLM_MAX_CHAR_BUFFER_CEREBRAS=100000
+
+# Ollama cloud — get key at ollama.com/settings/keys
+OLLAMA_BASE_URL=https://ollama.com/v1
+OLLAMA_API_KEY=your_ollama_api_key_here
+LLM_MAX_WORKERS_OLLAMA=1
+LLM_MAX_CHAR_BUFFER_OLLAMA=30000
+
+# Gemini 2.5 Flash — fallback — get key at aistudio.google.com/apikey
+LANGEXTRACT_API_KEY=your_gemini_api_key_here
+LLM_MAX_WORKERS_GEMINI=10
+LLM_MAX_CHAR_BUFFER=4000
 
 CURRENCY_DB_JSON=[{"code":"EUR","name":"Euro"},{"code":"USD","name":"US Dollar"}]
 
@@ -210,10 +226,10 @@ Pass an optional `"model"` field in the POST body to override the default primar
 | `"model"` value | Resolves to | Notes |
 |---|---|---|
 | _(omitted)_ | `LLM_MODEL_PRIMARY` from `.env` | Default |
-| `"fast"` | `gemini-2.0-flash` | Good quality, fastest |
-| `"quality"` | `gemini-2.5-pro` | Best accuracy, slower |
-| `"glm"` | `accounts/fireworks/models/glm-5` | Via Fireworks AI |
-| any raw model ID | used verbatim | e.g. `"gemini-2.5-flash-preview-04-17"` |
+| `"cerebras"` | `gpt-oss-120b` | GPT-OSS 120B via Cerebras (~3 000 tok/s) |
+| `"gpt-oss"` | `gpt-oss:120b` | GPT-OSS 120B via Ollama cloud |
+| `"gemini"` | `gemini-2.5-flash` | Google Gemini 2.5 Flash |
+| any raw model ID | used verbatim | e.g. `"gemini-2.5-flash"` |
 
 ### Fallback model
 
@@ -225,7 +241,7 @@ If the primary fails validation, the service automatically retries with `LLM_MOD
 Edit `MODEL_PROFILES` in `extractor/extraction.py` — one line, no migrations:
 
 ```python
-MODEL_PROFILES["turbo"] = "accounts/fireworks/models/llama-3.1-70b-turbo"
+MODEL_PROFILES["my-model"] = "actual-model-id"
 ```
 
 ---
@@ -268,14 +284,25 @@ POST /api/extract/
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `LANGEXTRACT_API_KEY` | ✅ | — | Gemini or OpenAI API key |
-| `FIREWORKS_API_KEY` | ❌ | — | Fireworks AI key (only for GLM-5) |
-| `LLM_MODEL_PRIMARY` | ❌ | `gemini-2.0-flash` | Default primary extraction model |
-| `LLM_MODEL_FALLBACK` | ❌ | `gemini-2.0-flash` | Fallback model on validation failure |
+| `LLM_MODEL_PRIMARY` | ❌ | `gpt-oss` | Default primary model (alias or raw ID) |
+| `LLM_MODEL_FALLBACK` | ❌ | `gemini-2.5-flash` | Fallback on validation failure |
+| `CEREBRAS_API_KEY` | ✅* | — | Cerebras cloud key (if using `cerebras` alias) |
+| `CEREBRAS_BASE_URL` | ❌ | `https://api.cerebras.ai/v1` | Cerebras endpoint |
+| `LLM_MAX_WORKERS_CEREBRAS` | ❌ | `1` | Parallel chunks for Cerebras |
+| `LLM_MAX_CHAR_BUFFER_CEREBRAS` | ❌ | `100000` | Chunk size for Cerebras (fits whole invoice) |
+| `OLLAMA_API_KEY` | ✅* | — | Ollama cloud key (if using `gpt-oss` alias) |
+| `OLLAMA_BASE_URL` | ❌ | `https://ollama.com/v1` | Ollama cloud endpoint |
+| `LLM_MAX_WORKERS_OLLAMA` | ❌ | `1` | Parallel chunks for Ollama |
+| `LLM_MAX_CHAR_BUFFER_OLLAMA` | ❌ | `30000` | Chunk size for Ollama |
+| `LANGEXTRACT_API_KEY` | ✅* | — | Gemini API key (if using `gemini` alias) |
+| `LLM_MAX_WORKERS_GEMINI` | ❌ | `10` | Parallel chunks for Gemini |
+| `LLM_MAX_CHAR_BUFFER` | ❌ | `4000` | Chunk size for Gemini |
 | `CURRENCY_DB_JSON` | ❌ | `[]` | JSON array of `{"code","name"}` pairs |
 | `DATABASE_URL` | ❌ | SQLite | PostgreSQL URL for production |
 | `DJANGO_SECRET_KEY` | ❌ | dev key | Change in production |
 | `DEBUG` | ❌ | `True` | Set `False` in production |
+
+*Required for the provider you are actively using.
 
 ---
 
@@ -289,7 +316,7 @@ python manage.py shell
 >>> from extractor.extraction import run_invoice_extraction
 >>> from extractor.models import ExtractionJob
 >>> job = ExtractionJob.objects.get(pk=42)
->>> result = run_invoice_extraction(job.ocr_draft, model_id="quality")
+>>> result = run_invoice_extraction(job.ocr_draft, model_id="gemini")
 >>> print(result["metrics"])
 ```
 
