@@ -68,7 +68,6 @@ LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.5-flash")
 CEREBRAS_BASE_URL            = os.environ.get("CEREBRAS_BASE_URL",            "https://api.cerebras.ai/v1")
 CEREBRAS_API_KEY             = os.environ.get("CEREBRAS_API_KEY",             "")
 LLM_MAX_WORKERS_CEREBRAS     = int(os.environ.get("LLM_MAX_WORKERS_CEREBRAS",     "20"))
-# 6 000 chars/chunk: keeps output well within token limits; 4 workers run chunks in parallel
 LLM_MAX_CHAR_BUFFER_CEREBRAS = int(os.environ.get("LLM_MAX_CHAR_BUFFER_CEREBRAS", "5000"))
 
 # Gemini performance tuning (fallback model)

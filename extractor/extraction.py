@@ -310,12 +310,40 @@ EXAMPLES = [
 
 # Fields that must be propagated from the header to all items
 _HEADER_FIELDS = ("document_date", "document_number", "country_sender",
-                  "currency_code", "currency_name")
+                  "currency_code", "currency_name", "country_origin")
+
+# Patterns to scan the FULL document text for global metadata that lives in
+# the footer (e.g. "СТРАНА ПРОИСХОЖДЕНИЯ: КИТАЙ", "Код валюты: 840").
+_FOOTER_PATTERNS: dict[str, re.Pattern] = {
+    "country_origin": re.compile(
+        # Capture 1–3 "words" (letters + hyphens only).
+        # The negative lookahead inside the optional group prevents swallowing
+        # sentence-starter words that immediately follow the country name on
+        # the same OCR line (e.g. "КИТАЙ Итого ДВЕСТИ...").
+        # When those words aren't present the {0,2} cap limits over-capture.
+        r"страна\s+происхождения\s*:?\s*"
+        r"([А-Яа-яёЁA-Za-z][А-Яа-яёЁA-Za-z-]*"
+        r"(?:\s+(?!итого\b|total\b|сумма\b|всего\b|\d)"
+        r"[А-Яа-яёЁA-Za-z][А-Яа-яёЁA-Za-z-]*){0,2})",
+        re.IGNORECASE,
+    ),
+    "currency_code": re.compile(
+        r"код\s+валюты\s*:?\s*(\d{3})",
+        re.IGNORECASE,
+    ),
+}
+
+# ISO 4217 numeric → alpha-3 for the currencies most common in CIS trade docs
+_ISO4217_NUMERIC_TO_ALPHA3: dict[str, str] = {
+    "840": "USD", "978": "EUR", "156": "CNY", "643": "RUB",
+    "417": "KGS", "398": "KZT", "860": "UZS", "826": "GBP",
+    "392": "JPY", "756": "CHF", "036": "AUD", "124": "CAD",
+}
 
 # Regex patterns to parse header metadata directly from OCR text
 _HEADER_PATTERNS = {
     "document_number": re.compile(
-        r"(?:invoice\s*(?:no|num|#|:)|№|накладн|счет|invoice)\W*([A-Z0-9\-/]{4,30})",
+        r"(?:invoice[ \t]*(?:no\.?|num\.?|#|:)|№|накладн|счет)[ \t.:,]*([A-Z0-9\-/]{4,30})",
         re.IGNORECASE,
     ),
     "document_date": re.compile(
@@ -393,6 +421,28 @@ def extract_header(cleaned_text: str) -> str:
 
 
 
+def parse_full_doc_metadata(context: str) -> dict:
+    """
+    Scan the FULL cleaned document text for global metadata that lives in the
+    footer rather than the header (e.g. СТРАНА ПРОИСХОЖДЕНИЯ, Код валюты).
+
+    Returns a dict with found values only.  Numeric currency codes are mapped
+    to ISO 4217 alpha-3 via _ISO4217_NUMERIC_TO_ALPHA3.
+    """
+    meta: dict = {}
+    for field, pattern in _FOOTER_PATTERNS.items():
+        m = pattern.search(context)
+        if not m:
+            continue
+        value = m.group(1).strip().rstrip(",;.")
+        if not value:
+            continue
+        if field == "currency_code":
+            value = _ISO4217_NUMERIC_TO_ALPHA3.get(value, value)
+        meta[field] = value
+    return meta
+
+
 def parse_header_metadata(header_text: str) -> dict:
     """
     Extract key metadata from the header text using regex.
@@ -428,7 +478,9 @@ def post_fill_from_header(items: list[dict], header_meta: dict,
             current = item.get(field)
             is_empty = (
                 current is None
-                or str(current).strip().lower() in ("", "null", "none", "0")
+                or str(current).strip().lower() in (
+                    "", "null", "none", "0", "неизвестно", "unknown",
+                )
             )
             if is_empty and field in header_meta:
                 item[field] = header_meta[field]
@@ -439,6 +491,41 @@ def post_fill_from_header(items: list[dict], header_meta: dict,
         if not item.get("currency_name") and header_currency_name:
             item["currency_name"] = header_currency_name
 
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Single-country spread — fill unknown origins when the whole invoice shares
+# one country of origin
+# ---------------------------------------------------------------------------
+
+_UNKNOWN_ORIGIN = frozenset({"неизвестно", "unknown", "не указано", "null", "none", ""})
+
+
+def spread_single_country_origin(items: list[dict]) -> list[dict]:
+    """
+    If every item that has a known country_origin carries the SAME value,
+    copy it to items whose country_origin is missing/unknown.
+
+    Safety rule: if two or more DISTINCT known countries exist in the list,
+    do nothing — the invoice has per-item origin data and spreading would
+    corrupt it.
+    """
+    known = {
+        str(item.get("country_origin", "")).strip()
+        for item in items
+        if str(item.get("country_origin", "")).strip().lower()
+        not in _UNKNOWN_ORIGIN
+    }
+    if len(known) != 1:
+        # 0 known → nothing to spread; 2+ → mixed origins, don't touch
+        return items
+
+    single = next(iter(known))
+    for item in items:
+        val = str(item.get("country_origin", "")).strip()
+        if val.lower() in _UNKNOWN_ORIGIN:
+            item["country_origin"] = single
     return items
 
 
@@ -798,6 +885,11 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
     header_context = extract_header(context)
     # Parse header metadata for post-fill fallback
     header_meta = parse_header_metadata(header_context)
+    # Scan the full document for global metadata in the footer (country of
+    # origin, numeric currency code) and merge — header takes precedence.
+    for k, v in parse_full_doc_metadata(context).items():
+        if k not in header_meta:
+            header_meta[k] = v
 
     def _extract(mid: str) -> tuple[str, object]:
         """Returns (json_str, annotated_doc) from LangExtract."""
@@ -856,6 +948,9 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
             unit = item.get("unit")
             if unit is None or str(unit).strip().lower() in ("", "null", "none"):
                 item["unit"] = "pcs"
+        # Spread a single global country_origin to items that are still unknown.
+        # Must run BEFORE finalize_items so country_origin_code gets filled too.
+        items = spread_single_country_origin(items)
         final_items = finalize_items(items, currency_db)
         # Remove cross-chunk duplicates: same invoice position extracted from
         # two overlapping chunks.  Keyed on the `position` field the model
@@ -1107,7 +1202,7 @@ def extract_with_langextract_optimized(
 
     # Gemini
     prompt = EXTRACTION_PROMPT
-    buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER", 10000)
+    buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER", 5000)
 
     try:
         annotated_doc = lx.extract(

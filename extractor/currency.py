@@ -126,7 +126,7 @@ def finalize_items(items: list[dict], currency_db: list[dict]) -> list[dict]:
       - normalise whitespace in description
       - resolve currency code/name from DB
       - map ISO country code → Russian name in country_origin
-      - ensure hs_code and suggestions fields are present
+      - ensure hs_code field is present
     Mirrors Node 1765342175106 logic.
     """
     final = []
@@ -163,10 +163,9 @@ def finalize_items(items: list[dict], currency_db: list[dict]) -> list[dict]:
             if resolved_code is not None:
                 item["country_origin_code"] = resolved_code
 
-        # Ensure hs_code and suggestions
+        # Ensure hs_code
         if "hs_code" not in item:
             item["hs_code"] = None
-        item["suggestions"] = item.get("suggestions", [])
 
         final.append(item)
 
