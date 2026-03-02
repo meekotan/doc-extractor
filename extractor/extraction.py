@@ -13,8 +13,8 @@ Optimisations over original Dify implementation:
   - extract_header()      → pulls top 25 lines of OCR as shared context
   - additional_context    → header injected into EVERY LangExtract chunk
   - post_fill_from_header → fills empty metadata fields from parsed header
-  - deduplicate_items()   → removes duplicate rows from bilingual invoices
-                            (RU description + EN packing list → same item twice)
+  - deduplicate_items()   → removes cross-chunk duplicates keyed on `position`
+                            (same POS in two overlapping chunks → merged once)
 """
 
 import json
@@ -32,6 +32,70 @@ from .currency import build_currency_db_string, finalize_items, load_currency_db
 from .metrics import RunMetrics, compute_field_fill_rates, timer
 
 
+# ---------------------------------------------------------------------------
+# Cerebras native SDK — singleton client + JSON schema for response_format
+# ---------------------------------------------------------------------------
+
+# JSON Schema that the Cerebras API enforces on the model's output.
+# Using an {"items": [...]} wrapper because json_schema mode requires an
+# object at the root (not a bare array).
+# validate_and_parse() already handles the {"items": [...]} dict unwrap.
+_CEREBRAS_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "position":            {"type": ["integer", "null"]},
+                    "description":         {"type": "string"},
+                    "hs_code":             {"type": ["string", "null"]},
+                    "quantity":            {"type": ["number", "null"]},
+                    "unit":                {"type": "string"},
+                    "cost":                {"type": ["number", "null"]},
+                    "price":               {"type": ["number", "null"]},
+                    "currency_code":       {"type": ["string", "null"]},
+                    "currency_name":       {"type": ["string", "null"]},
+                    "document_date":       {"type": ["string", "null"]},
+                    "document_number":     {"type": ["string", "null"]},
+                    "country_origin":      {"type": "string"},
+                    "country_origin_code": {"type": ["integer", "null"]},
+                    "country_sender":      {"type": ["string", "null"]},
+                },
+                "required": ["description"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+_CEREBRAS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name":   "invoice_items",
+        "schema": _CEREBRAS_ITEM_SCHEMA,
+    },
+}
+
+# Module-level singleton — created once, reused across all requests.
+# Lazy init so Django settings are available at first call time.
+_cerebras_client = None
+
+
+def _get_cerebras_client():
+    """Return the process-wide Cerebras client, creating it on first call."""
+    global _cerebras_client
+    if _cerebras_client is None:
+        from cerebras.cloud.sdk import Cerebras
+        _cerebras_client = Cerebras(
+            base_url=getattr(settings, "CEREBRAS_BASE_URL", "https://api.cerebras.ai"),
+            api_key=getattr(settings, "CEREBRAS_API_KEY", ""),
+        )
+        logger.debug("[cerebras] singleton client created (TCP warming active)")
+    return _cerebras_client
+
+
 def _repair_json(text: str) -> str:
     """
     Attempt to fix common JSON issues returned by LLMs:
@@ -46,13 +110,6 @@ def _repair_json(text: str) -> str:
     text = re.sub(r"\bFalse\b", "false", text)
     text = re.sub(r"\bNone\b", "null", text)
     return text
-
-import langextract as lx
-from langextract import factory as lx_factory
-from django.conf import settings
-
-from .currency import build_currency_db_string, finalize_items, load_currency_db
-from .metrics import RunMetrics, compute_field_fill_rates, timer
 
 # ---------------------------------------------------------------------------
 # Prompt / schema mirrors the original system prompt (Node 1765260372029)
@@ -75,6 +132,7 @@ You are a specialized agent for high-precision extraction of customs invoice dat
    - Extract every single row that has a price.
    - Do not merge similar rows. Do not skip any items.
 # FIELD SPECIFICATIONS
+- `position`: Integer row number from the № / POS / п/п column. Must be unique per invoice line. If missing, use null.
 - `description`: Full Russian name (priority) or English name. No summarization.
 - `hs_code`: String of digits. Verbatim copy.
 - `unit`: Standardize to: kg, pcs, l, set, m. (Default to "pcs" if missing).
@@ -103,75 +161,51 @@ EXTRACTION_PROMPT_GPT_OSS = """
 ROLE:
 You are a deterministic customs invoice line-item extractor.
 TASK:
-Extract ALL line items from the provided invoice text and return them as a JSON array.
-OUTPUT REQUIREMENTS (STRICT):
-- Output ONLY valid JSON.
-- Output MUST start with "[" and end with "]".
-- No markdown.
-- No explanations.
-- No comments.
-- No trailing text.
-- If no items are found, return [].
+Extract ALL line items from the provided invoice text.
 EXTRACTION RULES:
-1. LANGUAGE PRIORITY
+1. POSITION
+   - Read the row number from the № / POS / п/п / No. column and output it as "position" (integer).
+   - Each invoice line has a unique position. Two rows with identical data but different position numbers are genuinely different line items — DO NOT skip either.
+   - If no position column is present, output null.
+2. LANGUAGE PRIORITY
    - Prefer Russian descriptions.
    - If the document contains both Russian and English sections for the same item, extract ONLY the Russian description.
    - If the document is monolingual, preserve the original language exactly as written.
-2. HS CODE
+3. HS CODE
    - Copy exactly as written.
    - Do NOT truncate.
    - Do NOT normalize.
    - Do NOT add digits.
    - If multiple HS codes exist for one item, select the longest one.
-3. HEADER DATA (GLOBAL CONTEXT)
-   The block "additional_context" contains header-level data.
+4. HEADER DATA (GLOBAL CONTEXT)
+   The "=== DOCUMENT HEADER ===" block at the top of the document contains header-level data.
    The following fields MUST be copied to EVERY extracted item:
    - document_number
    - document_date
    - country_sender
    - currency_code
    - currency_name
-4. COST CALCULATION
-   - If unit cost is missing but total price and quantity are present:
-     cost = price / quantity
-   - If calculation is impossible, use null.
-   - Do NOT guess values.
-5. UNIT NORMALIZATION
+5. COST / PRICE FIELD MAPPING
+   - "cost"  = unit price (price per single item) — maps to columns named "unit_price", "Unit Price", "Preis/Einheit", etc.
+   - "price" = total line price (quantity × unit price) — maps to columns named "total_price", "Total", "Gesamtpreis", "Стоимость", etc.
+   - If "cost" is missing but "price" and "quantity" are present: cost = price / quantity.
+   - If calculation is impossible, use null. Do NOT guess.
+6. UNIT NORMALIZATION
    - If unit is missing, default to "pcs".
    - Allowed values ONLY:
      kg, pcs, l, set, m
    - Normalize variations (e.g., "шт." → "pcs", "кг" → "kg").
-6. COUNTRY OF ORIGIN
+7. COUNTRY OF ORIGIN
    - country_origin must be a 2-letter ISO code (e.g., DE, CN, RU).
    - If unknown, use "Неизвестно".
    - country_origin_code must be the numeric ISO country code.
    - If unknown, use null.
    - Do NOT invent country data.
-OUTPUT SCHEMA (REQUIRED KEYS FOR EACH ITEM):
-Use null if a field cannot be determined.
-[
-  {
-    "description": string,
-    "hs_code": string | null,
-    "quantity": number | null,
-    "unit": string | null,
-    "cost": number | null,
-    "price": number | null,
-    "currency_code": string | null,
-    "currency_name": string | null,
-    "document_date": string | null,
-    "document_number": string | null,
-    "country_origin": string,
-    "country_origin_code": number | null,
-    "country_sender": string | null
-  }
-]
-IMPORTANT:
-- Extract EVERY line item.
-- One JSON object per line item.
-- No deduplication.
-- No merging of separate rows.
-- No additional fields beyond the schema.
+OUTPUT:
+Return a JSON object: {"items": [...]}.
+The "items" array contains one object per invoice line item.
+No markdown, no explanation, no preamble.
+If no items found, return {"items": []}.
 """
 
 # Few-shot examples that teach LangExtract the schema shape.
@@ -206,6 +240,8 @@ EXAMPLES = [
                 # Bilingual: extraction_text = Russian description
                 extraction_text="Ноутбук Dell XPS",
                 attributes={
+                    # Row number from the № column
+                    "position": 1,
                     # Prefer the longer 10-digit RU code over the 8-digit EN code
                     "hs_code": "8471309900",
                     # Bilingual: use Russian description, not English
@@ -245,6 +281,8 @@ EXAMPLES = [
                 # Monolingual EN: extraction_text = English description
                 extraction_text="Industrial servo motor",
                 attributes={
+                    # Row number from the No. column
+                    "position": 1,
                     # 8-digit hs_code — valid length, must NOT be extended to 10
                     "hs_code": "85016100",
                     # Monolingual EN: keep English description as-is
@@ -285,7 +323,8 @@ _HEADER_PATTERNS = {
         re.IGNORECASE,
     ),
     "country_sender": re.compile(
-        r"(?:sender|отправитель|shipper|from|страна отправ\w*)\W*:?\s*([A-Za-zА-Яа-яёЁ ]{3,40})",
+        # "sender" removed — too generic (matches "Temperature sender", "Pressure sender", etc.)
+        r"\b(?:отправитель|shipper|страна\s+отправ\w*)\b\W*:?\s*([A-Za-zА-Яа-яёЁ ]{3,40})",
         re.IGNORECASE,
     ),
 }
@@ -293,8 +332,15 @@ _HEADER_PATTERNS = {
 
 # Признак строки с товарной позицией: строка начинается с порядкового номера
 # (цифра + пробел/таб) И содержит числовую цену (1234.56 или 1234,56).
+# Также матчит pipe-delimited строки вида "| 1 | ..." или "| 107 | ...".
 # Такие строки НЕ включаются в шапку.
-_ITEM_ROW_START_RE = re.compile(r'^\s*\d+[\s\t]+\S')
+_ITEM_ROW_START_RE = re.compile(
+    r'(?:'
+    r'^\s*\d+[\s\t]+\S'       # bare format:  "1  Description" or "107\tSomething"
+    r'|^\s*\|\s*\d+\s*\|'     # piped format: "| 1 | ..." or "| 107 | ..."
+    r')',
+    re.MULTILINE,
+)
 _PRICE_RE          = re.compile(r'\b\d+[.,]\d{2}\b')
 
 # Признак строки-заголовка таблицы: содержит ключевые слова названий колонок.
@@ -402,76 +448,190 @@ def post_fill_from_header(items: list[dict], header_meta: dict,
 
 def deduplicate_items(items: list[dict]) -> list[dict]:
     """
-    Remove duplicate invoice rows that arise when an OCR document contains
-    the same goods in multiple sections (e.g. RU table + EN customs table +
-    RU packing list — all three repeat the same items).
+    Remove cross-chunk duplicate rows.
 
-    Strategy — single pass by (normalized_description, price, quantity, cost).
+    --- Why (position, cost, quantity) and not position alone ---
+    Some invoices contain multiple sub-tables, each numbered from 1.
+    E.g. sub-invoice 1 POS 1 = "БПЛА 37 410 EUR" and
+         sub-invoice 2 POS 1 = "Комплект шасси 3 500 EUR".
+    Keying only on position would silently drop one of them.
+    Adding cost + quantity makes the key unique per genuinely distinct item.
 
-    Adding the normalized description to the key makes deduplication safe for
-    two conflicting cases:
-    - Bilingual invoice with repeated sections: each item appears 2-3× with
-      IDENTICAL Russian descriptions and identical numerics → correctly merged.
-    - Dense invoice (e.g. 217 items): different items that happen to share the
-      same price/qty/cost have DIFFERENT descriptions → NOT merged → all preserved.
+    --- Why NOT add description to the key ---
+    Bilingual invoices: Russian chunk and English chunk carry the same item
+    under different descriptions ("Кронштейн" vs "Console").  If description
+    were part of the key they would never merge.  Description is used only as
+    a tie-breaker (Russian preferred over English), not as a discriminator.
 
-    The row that is kept is always the one with the most filled fields (richer row).
+    --- HS-code conflict guard ---
+    If two items share (position, cost, quantity) but carry different non-null
+    HS codes, they are treated as genuinely different items — both kept.
+    This guards against edge-cases where two cheap commodity items coincidentally
+    share the same pos/cost/qty combination.
+
+    --- Field-level merge ---
+    When a true duplicate is found, fields are merged individually rather than
+    replacing the whole object:
+      - description : prefer Russian over English
+      - hs_code, country_* , currency_*, document_* : prefer non-null
+      - cost / price / quantity : prefer non-zero
+    This captures the best information from both chunks.
     """
     if not items:
         return items
 
-    def _numeric(val, decimals: int = 2) -> float:
+    _EMPTY = {"", "null", "none"}
+
+    def _is_empty(v) -> bool:
+        return v is None or str(v).strip().lower() in _EMPTY
+
+    def _is_cyrillic(text: str) -> bool:
+        return bool(re.search(r'[А-Яа-яёЁ]', str(text or "")))
+
+    def _norm_num(v, decimals: int = 2) -> float:
         try:
-            return round(float(val), decimals)
+            return round(float(v or 0), decimals)
         except (TypeError, ValueError):
-            return -1.0
+            return 0.0
 
-    def _normalize_description(desc: str) -> str:
-        """Lowercase, strip punctuation, collapse whitespace."""
-        s = str(desc or "").lower()
-        s = re.sub(r'[^\w]', ' ', s)
-        s = re.sub(r'\s+', ' ', s).strip()
-        return s
+    def _norm_hs(v) -> str | None:
+        if _is_empty(v):
+            return None
+        return str(v).strip()
 
-    def _filled_count(item: dict) -> int:
-        """Count non-empty fields — used to prefer the richer row."""
-        return sum(
-            1 for v in item.values()
-            if v is not None and str(v).strip().lower() not in ("", "null", "none", "0")
-        )
+    def _make_key(item: dict) -> tuple | None:
+        raw_pos = item.get("position")
+        try:
+            pos = int(raw_pos) if raw_pos is not None else None
+        except (TypeError, ValueError):
+            pos = None
+        if pos is None:
+            return None
+        return (pos, _norm_num(item.get("cost")), _norm_num(item.get("quantity"), 3))
 
-    # --- Pass 1: dedup by (normalized_description, price, quantity, cost) ---
-    seen_exact: dict[tuple, int] = {}   # key → index in result list
+    def _hs_conflict(a: dict, b: dict) -> bool:
+        """True when both items have non-null, differing HS codes."""
+        ha, hb = _norm_hs(a.get("hs_code")), _norm_hs(b.get("hs_code"))
+        return ha is not None and hb is not None and ha != hb
+
+    def _merge(base: dict, new: dict) -> dict:
+        """Merge *new* into a copy of *base*, field by field."""
+        out = dict(base)
+        # description: prefer Russian
+        if _is_cyrillic(new.get("description", "")) and \
+                not _is_cyrillic(out.get("description", "")):
+            out["description"] = new["description"]
+        # nullable metadata: take first non-empty value
+        for f in ("hs_code", "country_origin", "country_origin_code",
+                  "currency_code", "currency_name",
+                  "document_date", "document_number", "country_sender"):
+            if _is_empty(out.get(f)) and not _is_empty(new.get(f)):
+                out[f] = new[f]
+        # numeric fields: prefer non-zero
+        for f in ("cost", "price", "quantity"):
+            if _norm_num(out.get(f)) == 0.0 and _norm_num(new.get(f)) != 0.0:
+                out[f] = new[f]
+        return out
+
+    seen: dict[tuple, int] = {}   # dedup_key → index in result
     result: list[dict] = []
 
     for item in items:
-        key = (
-            _normalize_description(item.get("description", "")),
-            _numeric(item.get("price")),
-            _numeric(item.get("quantity"), 3),
-            _numeric(item.get("cost")),
-        )
-        # Skip rows where all numeric values are zero/missing — likely
-        # header lines that slipped through validation.
-        if key[1:] == (-1.0, -1.0, -1.0) or key[1:] == (0.0, 0.0, 0.0):
+        key = _make_key(item)
+
+        if key is None:
+            # No parseable position — pass through unchanged
             result.append(item)
             continue
 
-        if key in seen_exact:
-            # Keep the richer row
-            existing_idx = seen_exact[key]
-            if _filled_count(item) > _filled_count(result[existing_idx]):
-                result[existing_idx] = item
+        if key in seen:
+            existing_idx = seen[key]
+            existing = result[existing_idx]
+
+            if _hs_conflict(item, existing):
+                # Different items that accidentally share pos+cost+qty
+                # Keep both — do NOT update `seen` so the first item's slot
+                # remains reachable for future merges of its own duplicates.
+                result.append(item)
+            else:
+                # True cross-chunk duplicate — merge fields
+                result[existing_idx] = _merge(existing, item)
         else:
-            seen_exact[key] = len(result)
+            seen[key] = len(result)
             result.append(item)
 
     return result
 
 
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — text cleaning  (mirrors Node 1765260281035)
 # ---------------------------------------------------------------------------
+
+def _normalize_pipe_table(text: str) -> str:
+    """
+    Normalize OCR invoice text before chunking and LLM extraction.
+
+    Fixes two issues that cause truncation on multi-sub-table invoices:
+
+    1. Single-line OCR — some systems emit the entire Markdown table as one
+       long line.  _split_text_into_chunks splits only on \\n, so the whole
+       invoice lands in one oversized chunk.  The LLM is then forced to
+       generate a very long JSON response and may stop early (output-token
+       limit) or misinterpret the structure.
+
+       Fix: insert \\n before every "| N | LETTER" pattern — numbered item
+       rows whose description starts with a letter.  This distinguishes item-
+       row boundaries from price/quantity cells (which never have a letter
+       immediately after the closing | of a digit cell).
+
+    2. Sub-table separator rows — multi-page invoices contain horizontal
+       |---|---| dividers at page-break boundaries between sub-tables.
+       LLMs trained on Markdown interpret these as "end of table" and stop
+       extracting after the separator.  On the sample invoice this caused
+       extraction to stop at position 26 (end of the first sub-table).
+
+       Fix: (a) move any trailing separator sequence at the end of a content
+       line onto its own line, then (b) delete lines that consist solely of
+       |, - and spaces (no letters or digits).
+
+    The transform is idempotent: already-multiline OCR with no separator rows
+    passes through unchanged.
+    """
+    # Step 1 — split single-line tables into one row per line.
+    #
+    # Lookbehind: right after a | (end of previous row / separator).
+    # Consumed:   optional spaces/tabs between rows.
+    # Lookahead:  "| N | LETTER" — row-number cell followed by a description
+    #             cell whose first character is a letter.
+    #
+    # Why the letter requirement?  Price cells like "| 900 |" or "| 150 |"
+    # must NOT trigger a split — they share the same pattern (| digit |) but
+    # are followed by another digit or end-of-row, never by a letter.
+    text = re.sub(
+        r'(?<=\|)[ \t]*(?=\|[ \t]*\d{1,4}[ \t]*\|[ \t]*[А-Яа-яёЁA-Za-z])',
+        '\n',
+        text,
+    )
+
+    # Step 2 — extract trailing separator sequences to their own line.
+    # After step 1 the first-page header line may still end with the column-
+    # header separator: "...Сумма USD | |----|----|".
+    # Replace "| |---...----|" at end-of-line with just "|" so step 3 can
+    # remove the now-isolated separator line.
+    text = re.sub(r'[ \t]*\|[- \t|]+\|[ \t]*$', '|', text, flags=re.MULTILINE)
+
+    # Step 3 — remove standalone separator lines.
+    # A separator line contains ONLY pipes, dashes, and whitespace — no
+    # letters and no digits.  These mark page breaks between sub-tables.
+    text = re.sub(r'^[|\- \t]+$', '', text, flags=re.MULTILINE)
+
+    # Step 4 — collapse blank lines left after separator removal.
+    text = re.sub(r'\n{2,}', '\n', text)
+
+    return text
+
 
 def clean_text(raw_text: str, currency_db_str: str) -> str:
     """Clean OCR text and prepend the currency database block."""
@@ -479,6 +639,10 @@ def clean_text(raw_text: str, currency_db_str: str) -> str:
         return ""
 
     text = raw_text.replace("\r", "")
+    # Normalise pipe-table OCR: split single-line tables into rows and remove
+    # sub-table separator lines (|---|---| page-break markers) that cause the
+    # LLM to stop extracting after the first sub-table.
+    text = _normalize_pipe_table(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     lines = []
@@ -538,7 +702,7 @@ def validate_and_parse(text: str) -> dict:
     # 3. Нормализация структуры
     # Если на выходе словарь с ключом 'items' (результат response_schema) — разворачиваем его
     if isinstance(parsed_data, dict):
-        parsed_data = parsed_data.get("items", [parsed_data])
+        parsed_data = parsed_data.get("items", parsed_data.get("extractions", [parsed_data]))
     
     # Если это список списков (результат слияния нескольких чанков), выпрямляем его
     if isinstance(parsed_data, list) and any(isinstance(i, list) for i in parsed_data):
@@ -660,7 +824,7 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
 
         with timer() as t:
             validation = validate_and_parse(raw_output)
-        m.t_validate_s += t[0]
+            m.t_validate_s += t[0]
         m.fallback_valid = bool(validation["is_valid"])
 
     if not validation["is_valid"]:
@@ -693,10 +857,10 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
             if unit is None or str(unit).strip().lower() in ("", "null", "none"):
                 item["unit"] = "pcs"
         final_items = finalize_items(items, currency_db)
-        # Remove cross-section duplicates (bilingual invoices repeat items in
-        # RU + EN + packing-list sections). Safe for dense invoices too because
-        # the key includes normalized description — different items with the
-        # same price/qty/cost are NOT merged.
+        # Remove cross-chunk duplicates: same invoice position extracted from
+        # two overlapping chunks.  Keyed on the `position` field the model
+        # reads from the №/POS column — different positions with identical
+        # data (e.g. POS 7 and POS 8 brackets) are NOT merged.
         final_items = deduplicate_items(final_items)
     m.t_finalize_s = t[0]
 
@@ -709,6 +873,7 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
         "metrics": m.to_dict(),
         "annotated_doc": annotated_doc,   # lx.data.AnnotatedDocument — for visualizer
         "model_id": effective_model,
+        "raw_llm_output": raw_output,     # JSON str from LangExtract — for prompt debugging
     }
 
 
@@ -717,11 +882,10 @@ def run_invoice_extraction(ocr_draft: str, model_id: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 # Edit this dict to add/rename profiles. Keys are the strings callers can pass
-# in the POST body as {"model": "gpt-oss"}.  Values are the actual model IDs sent
-# to LangExtract.  You can also pass a raw model ID directly (e.g.
+# in the POST body as {"model": "cerebras"}.  Values are the actual model IDs sent
+# to the respective provider.  You can also pass a raw model ID directly (e.g.
 # "gemini-2.5-flash") — resolve_model_id() will use it verbatim.
 MODEL_PROFILES: dict[str, str] = {
-    "gpt-oss":   "gpt-oss:120b",     # GPT-OSS 120B via Ollama cloud
     "cerebras":  "gpt-oss-120b",     # GPT-OSS 120B via Cerebras (3k tok/s)
     "gemini":    "gemini-2.5-flash", # Google Gemini 2.5 Flash (fallback)
 }
@@ -734,81 +898,187 @@ def resolve_model_id(model_spec: str | None) -> str:
     Resolution order:
       1. None / ""       → LLM_MODEL_PRIMARY from Django settings (alias-resolved)
       2. Profile alias   → MODEL_PROFILES[model_spec]
-      3. Raw model ID    → used verbatim (e.g. "gpt-oss:120b", "gemini-2.5-flash")
+      3. Raw model ID    → used verbatim (e.g. "gpt-oss-120b", "gemini-2.5-flash")
     """
     if not model_spec:
-        primary = getattr(settings, "LLM_MODEL_PRIMARY", "gpt-oss:120b")
+        primary = getattr(settings, "LLM_MODEL_PRIMARY", "gpt-oss-120b")
         return MODEL_PROFILES.get(primary, primary)
     return MODEL_PROFILES.get(model_spec, model_spec)
 
 
 # ---------------------------------------------------------------------------
-# Provider resolution — Ollama cloud (gpt-oss) and Gemini
+# Provider resolution — Cerebras and Gemini
 # ---------------------------------------------------------------------------
-
-# OpenAI-compatible providers: prefix → sentinel (actual URL resolved from settings at call time)
-_OPENAI_COMPATIBLE = {
-    "gpt-oss": "ollama",   # Ollama cloud — base_url from settings.OLLAMA_BASE_URL
-}
-
-
-def _register_openai_compatible_patterns() -> None:
-    """
-    Register OpenAI-compatible model prefixes into LangExtract's router so
-    model IDs like 'gpt-oss:120b' resolve to OpenAILanguageModel automatically
-    (priority 20 beats default 10). Idempotent — router deduplicates entries.
-    """
-    import langextract.providers as lx_providers
-    from langextract.providers import router as lx_router
-    from langextract.providers.openai import OpenAILanguageModel
-    lx_providers.load_builtins_once()
-    for prefix in _OPENAI_COMPATIBLE:
-        pattern = r"^" + prefix.replace("/", r"\/")
-        lx_router.register(pattern, priority=20)(OpenAILanguageModel)
-
-
-# Register at import time (runs once per process)
-_register_openai_compatible_patterns()
-
 
 def _build_lx_config(model_id: str) -> lx_factory.ModelConfig:
     """
     Build a LangExtract ModelConfig:
-      - gpt-oss:120b  → Ollama cloud   (OLLAMA_BASE_URL  / OLLAMA_API_KEY)
       - gpt-oss-120b  → Cerebras cloud (CEREBRAS_BASE_URL / CEREBRAS_API_KEY)
       - gemini-*      → Google Gemini  (LANGEXTRACT_API_KEY)
-
-    Distinction: Ollama model IDs use a colon tag (gpt-oss:120b);
-    Cerebras model IDs use a hyphen (gpt-oss-120b).
     """
     if model_id.startswith("gpt-oss"):
-        if ":" in model_id:   # Ollama format: gpt-oss:120b
-            return lx_factory.ModelConfig(
-                model_id=model_id,
-                provider_kwargs={
-                    "base_url":    getattr(settings, "OLLAMA_BASE_URL", "https://ollama.com/v1"),
-                    "api_key":     getattr(settings, "OLLAMA_API_KEY", "ollama") or "ollama",
-                    "max_workers": getattr(settings, "LLM_MAX_WORKERS_OLLAMA", 1),
-                },
-            )
-        else:                  # Cerebras format: gpt-oss-120b
-            return lx_factory.ModelConfig(
-                model_id=model_id,
-                provider_kwargs={
-                    "base_url":    getattr(settings, "CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
-                    "api_key":     getattr(settings, "CEREBRAS_API_KEY", "") or None,
-                    "max_workers": getattr(settings, "LLM_MAX_WORKERS_CEREBRAS", 1),
-                },
-            )
+        # Cerebras format: gpt-oss-120b
+        return lx_factory.ModelConfig(
+            model_id=model_id,
+            provider_kwargs={
+                "base_url":    getattr(settings, "CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
+                "api_key":     getattr(settings, "CEREBRAS_API_KEY", "") or None,
+                "max_workers": getattr(settings, "LLM_MAX_WORKERS_CEREBRAS", 20),
+            },
+        )
 
     # Gemini — auto-resolved by router
     return lx_factory.ModelConfig(
         model_id=model_id,
         provider_kwargs={
             "api_key":     getattr(settings, "LANGEXTRACT_API_KEY", "") or None,
-            "max_workers": getattr(settings, "LLM_MAX_WORKERS_GEMINI", 10),
+            "max_workers": getattr(settings, "LLM_MAX_WORKERS_GEMINI", 5),
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct Cerebras extraction (bypasses LangExtract entirely)
+# ---------------------------------------------------------------------------
+
+def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
+    """
+    Split *text* into chunks of at most *max_chars* characters, always
+    cutting at newline boundaries so no invoice row is split mid-way.
+    """
+    lines = text.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1  # +1 for the rejoining newline
+        if current_len + line_len > max_chars and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current))
+
+    return chunks
+
+
+def extract_cerebras_direct(
+    context_text: str,
+    model_id: str,
+    header_context: str = "",
+) -> tuple[str, None]:
+    """
+    Native Cerebras SDK with parallel chunking — no LangExtract, no resolver.
+
+    Why native SDK (not openai + base_url):
+      - Auto-retry with exponential backoff on 429 / 5xx.  The old openai
+        approach silently caught 429s as empty "[]", causing chunks 2-N to
+        disappear under rate limits on large invoices.
+      - response_format JSON schema: model is FORCED to emit valid {"items":[…]},
+        eliminating ResolverParsingError, unquoted keys, and field-name drift
+        (unit_price vs cost, total_price vs price).
+      - TCP warming on client construction reduces time-to-first-token.
+      - Singleton client (_get_cerebras_client) reuses the HTTP pool.
+
+    Why chunking:
+      Sending 200+ items in one shot → model stops early.  5 000-char chunks
+      (~40-50 items each) keep each call focused; parallel workers finish the
+      whole invoice in roughly single-call wall time.
+
+    Tuning via .env:
+      LLM_MAX_CHAR_BUFFER_CEREBRAS  (default 5 000)
+      LLM_MAX_WORKERS_CEREBRAS      (default 20)
+
+    Returns (json_str, None) — None because there is no AnnotatedDocument.
+    """
+    import concurrent.futures
+
+    buffer      = getattr(settings, "LLM_MAX_CHAR_BUFFER_CEREBRAS", 5000)
+    max_workers = getattr(settings, "LLM_MAX_WORKERS_CEREBRAS", 20)
+
+    chunks    = _split_text_into_chunks(context_text, buffer)
+    n_workers = min(len(chunks), max_workers)
+
+    logger.debug(
+        "[cerebras_direct] model=%s  total_chars=%d  chunks=%d  workers=%d",
+        model_id, len(context_text), len(chunks), n_workers,
+    )
+
+    client = _get_cerebras_client()
+
+    def _call_chunk(idx_chunk: tuple[int, str]) -> tuple[int, str]:
+        idx, chunk = idx_chunk
+        # Label each chunk so the model knows it's extracting invoice items
+        labelled = (
+            f"=== INVOICE ITEMS — SECTION {idx + 1} OF {len(chunks)} ===\n{chunk}"
+        )
+        user_content = f"{header_context}\n\n{labelled}" if header_context else labelled
+        try:
+            resp = client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": EXTRACTION_PROMPT_GPT_OSS},
+                    {"role": "user",   "content": user_content},
+                ],
+                temperature=0,
+                response_format=_CEREBRAS_RESPONSE_FORMAT,
+                # Raise the output-token ceiling so the model never stops
+                # mid-array on large invoices (default ~4 096 is too low for
+                # 50+ items × ~150 tokens/item).
+                max_tokens=32768,
+            )
+            raw = resp.choices[0].message.content or '{"items":[]}'
+            # Log Cerebras-native per-chunk latency breakdown
+            if hasattr(resp, "time_info") and resp.time_info:
+                ti = resp.time_info
+                logger.debug(
+                    "[cerebras_direct] chunk %d  queue=%.3fs  prompt=%.3fs  completion=%.3fs  total=%.3fs",
+                    idx,
+                    getattr(ti, "queue_time", 0) or 0,
+                    getattr(ti, "prompt_process_time", 0) or 0,
+                    getattr(ti, "completion_time", 0) or 0,
+                    getattr(ti, "total_time", 0) or 0,
+                )
+            return idx, raw
+        except Exception as exc:
+            logger.warning(
+                "[cerebras_direct] chunk %d failed (%s: %s)",
+                idx, type(exc).__name__, exc,
+                exc_info=True,
+            )
+            return idx, '{"items":[]}'
+
+    # pool.map preserves submission order and blocks until all chunks finish
+    all_items: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for idx, raw in pool.map(_call_chunk, enumerate(chunks)):
+            parsed = None
+            for candidate in (raw, _repair_json(raw)):
+                try:
+                    parsed = json.loads(candidate)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if parsed is None:
+                logger.warning("[cerebras_direct] chunk %d: JSON parse failed, skipping", idx)
+                continue
+            # Unwrap {"items":[]} (expected with schema) or bare array (fallback)
+            if isinstance(parsed, dict):
+                parsed = parsed.get("items", parsed.get("extractions", [parsed]))
+            if isinstance(parsed, list):
+                all_items.extend(parsed)
+
+    combined = json.dumps(all_items, ensure_ascii=False)
+    logger.debug(
+        "[cerebras_direct] model=%s  chunks=%d  raw_items=%d  preview=%.400s",
+        model_id, len(chunks), len(all_items), combined[:400],
+    )
+    return combined, None
 
 
 # ---------------------------------------------------------------------------
@@ -821,26 +1091,23 @@ def extract_with_langextract_optimized(
     header_context: str = "",
 ) -> tuple[str, object]:
     """
-    Run LangExtract extraction and return (json_str, annotated_doc).
+    Run extraction and return (json_str, annotated_doc).
 
-    Supports:
-      - gpt-oss:120b → Ollama cloud  (plain prompt, 30k  char buffer, 1 worker)
-      - gpt-oss-120b → Cerebras      (plain prompt, 100k char buffer, 1 worker)
-      - gemini-*     → Google Gemini (XML prompt,   4k   char buffer, 10 workers)
+    Routing:
+      - gpt-oss-120b → Cerebras direct API (bypasses LangExtract — see extract_cerebras_direct)
+      - gemini-*     → Google Gemini via LangExtract (4k char buffer, N workers)
 
-    The second element is an ``lx.data.AnnotatedDocument``.
+    The second element is an ``lx.data.AnnotatedDocument`` (None for Cerebras direct).
     """
+    if model_id.startswith("gpt-oss"):
+        # Cerebras: gpt-oss-120b — bypass LangExtract, call API directly
+        return extract_cerebras_direct(context_text, model_id, header_context)
+
     config = _build_lx_config(model_id)
 
-    if model_id.startswith("gpt-oss"):
-        prompt = EXTRACTION_PROMPT_GPT_OSS
-        if ":" in model_id:   # Ollama: gpt-oss:120b  (unknown context window → 30k safe)
-            buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER_OLLAMA", 30000)
-        else:                  # Cerebras: gpt-oss-120b (131K ctx → 100k fits any invoice)
-            buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER_CEREBRAS", 100000)
-    else:
-        prompt = EXTRACTION_PROMPT
-        buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER", 4000)
+    # Gemini
+    prompt = EXTRACTION_PROMPT
+    buffer = getattr(settings, "LLM_MAX_CHAR_BUFFER", 10000)
 
     try:
         annotated_doc = lx.extract(
@@ -852,15 +1119,25 @@ def extract_with_langextract_optimized(
             max_char_buffer=buffer,
         )
     except Exception as exc:
-        logger.warning("lx.extract() failed (%s: %s) — returning empty result", type(exc).__name__, exc)
+        logger.warning(
+            "lx.extract() failed (%s: %s) — returning empty result",
+            type(exc).__name__, exc,
+            exc_info=True,   # full traceback in server logs
+        )
         return "[]", None
 
     all_items = []
     for extraction in annotated_doc.extractions:
-
         item = {"description": extraction.extraction_text}
         if extraction.attributes:
             item.update(extraction.attributes)
         all_items.append(item)
+
+    logger.debug(
+        "[raw_output] model=%s  extracted=%d items  preview=%s",
+        model_id,
+        len(all_items),
+        json.dumps(all_items[:3], ensure_ascii=False)[:500],
+    )
 
     return json.dumps(all_items, ensure_ascii=False), annotated_doc
