@@ -26,10 +26,7 @@ def check_llm_api() -> dict:
     primary_spec  = getattr(settings, "LLM_MODEL_PRIMARY", "")
     primary_model = MODEL_PROFILES.get(primary_spec, primary_spec)
 
-    if ":" in primary_model and primary_model.startswith("gpt-oss"):
-        key      = getattr(settings, "OLLAMA_API_KEY", "")
-        provider = "Ollama"
-    elif primary_model.startswith("gpt-oss-"):
+    if primary_model.startswith("gpt-oss"):
         key      = getattr(settings, "CEREBRAS_API_KEY", "")
         provider = "Cerebras"
     else:

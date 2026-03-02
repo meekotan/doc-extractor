@@ -36,5 +36,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# ── Reports / scratch files ──────────────────────────────────────────────────
+REPORT*.md
+report*.md
+
 # ── Claude Code internal ─────────────────────────────────────────────────────
 .claude/
