@@ -59,10 +59,22 @@ else:
     }
 
 # LangExtract / LLM configuration
-LANGEXTRACT_API_KEY = os.environ.get("LANGEXTRACT_API_KEY", "")   # Gemini / default
-FIREWORKS_API_KEY   = os.environ.get("FIREWORKS_API_KEY",   "")   # Fireworks AI
-LLM_MODEL_PRIMARY  = os.environ.get("LLM_MODEL_PRIMARY",  "gemini-2.0-flash")
-LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.0-flash")
+LANGEXTRACT_API_KEY = os.environ.get("LANGEXTRACT_API_KEY", "")   # Gemini API key
+LLM_MODEL_PRIMARY  = os.environ.get("LLM_MODEL_PRIMARY",  "gpt-oss-120b")
+LLM_MODEL_FALLBACK = os.environ.get("LLM_MODEL_FALLBACK", "gemini-2.5-flash")
+
+# Cerebras cloud — GPT-OSS 120B (alias: "cerebras", raw: "gpt-oss-120b")
+# ~3000 tok/s, 131K context window. Get key at: cerebras.ai/openai
+CEREBRAS_BASE_URL            = os.environ.get("CEREBRAS_BASE_URL",            "https://api.cerebras.ai/v1")
+CEREBRAS_API_KEY             = os.environ.get("CEREBRAS_API_KEY",             "")
+LLM_MAX_WORKERS_CEREBRAS     = int(os.environ.get("LLM_MAX_WORKERS_CEREBRAS",     "20"))
+LLM_MAX_CHAR_BUFFER_CEREBRAS = int(os.environ.get("LLM_MAX_CHAR_BUFFER_CEREBRAS", "5000"))
+
+# Gemini performance tuning (fallback model)
+# max_char_buffer: chars per chunk — smaller keeps Gemini within rate limits
+# max_workers_gemini: parallel chunk workers
+LLM_MAX_CHAR_BUFFER    = int(os.environ.get("LLM_MAX_CHAR_BUFFER",    "4000"))
+LLM_MAX_WORKERS_GEMINI = int(os.environ.get("LLM_MAX_WORKERS_GEMINI", "10"))
 
 # Currency database — JSON string loaded from env (matches CURRENCY_DB_JSON in original workflow)
 CURRENCY_DB_JSON = os.environ.get("CURRENCY_DB_JSON", "[]")

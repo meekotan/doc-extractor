@@ -62,6 +62,12 @@ class InvoiceExtractView(APIView):
         viz_data = _serialize_annotated_doc(output.get("annotated_doc"))
         model_id_used = output.get("model_id", "")
 
+        # Attach raw LLM output to metrics for prompt debugging.
+        # Trimmed to 10 000 chars so large invoices don't bloat the DB.
+        raw_llm = output.get("raw_llm_output", "")
+        if raw_llm:
+            metrics["raw_llm_output"] = raw_llm[:10_000]
+
         if "error" in output:
             job.status = ExtractionJob.STATUS_FAILED
             job.error = output["error"]

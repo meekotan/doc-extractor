@@ -21,7 +21,7 @@ class RunMetrics:
 
     # ── Accuracy / quality indicators ───────────────────────────────────────
     items_extracted: int = 0        # Number of items in final output
-    fallback_used: bool = False     # True if GPT-4o fallback was triggered
+    fallback_used: bool = False     # True if Gemini fallback was triggered
     primary_valid: bool = False     # True if primary LLM passed validation
     fallback_valid: bool = False    # True if fallback passed (n/a if unused)
 
