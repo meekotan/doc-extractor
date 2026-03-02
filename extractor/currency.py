@@ -68,6 +68,30 @@ _ISO_TO_RUSSIAN: dict[str, str] = {
     "GB": "Великобритания", "US": "США", "UZ": "Узбекистан", "VN": "Вьетнам",
 }
 
+# ISO 3166-1 numeric codes (mirrors the ISO-2 keys above)
+_ISO_TO_NUMERIC: dict[str, int] = {
+    "AF": 4,   "AL": 8,   "DZ": 12,  "AR": 32,  "AM": 51,  "AU": 36,
+    "AT": 40,  "AZ": 31,  "BY": 112, "BE": 56,  "BR": 76,  "BG": 100,
+    "CA": 124, "CL": 152, "CN": 156, "CO": 170, "HR": 191, "CZ": 203,
+    "DK": 208, "EG": 818, "EE": 233, "FI": 246, "FR": 250, "GE": 268,
+    "DE": 276, "GR": 300, "HK": 344, "HU": 348, "IN": 356, "ID": 360,
+    "IR": 364, "IQ": 368, "IE": 372, "IL": 376, "IT": 380, "JP": 392,
+    "KZ": 398, "KG": 417, "LV": 428, "LT": 440, "LU": 442, "MY": 458,
+    "MX": 484, "MD": 498, "NL": 528, "NZ": 554, "NO": 578, "PK": 586,
+    "PE": 604, "PH": 608, "PL": 616, "PT": 620, "RO": 642, "RU": 643,
+    "SA": 682, "RS": 688, "SG": 702, "SK": 703, "SI": 705, "ZA": 710,
+    "KR": 410, "ES": 724, "SE": 752, "CH": 756, "TW": 158, "TJ": 762,
+    "TH": 764, "TN": 788, "TR": 792, "TM": 795, "UA": 804, "GB": 826,
+    "US": 840, "UZ": 860, "VN": 704,
+}
+
+# Reverse lookup: Russian name → numeric code (built once at import time)
+_RUSSIAN_TO_NUMERIC: dict[str, int] = {
+    rus.lower(): _ISO_TO_NUMERIC[iso]
+    for iso, rus in _ISO_TO_RUSSIAN.items()
+    if iso in _ISO_TO_NUMERIC
+}
+
 
 def resolve_country(raw: str | None) -> str | None:
     """Map ISO-2 country code to Russian name. Returns original value if not mapped."""
@@ -75,6 +99,25 @@ def resolve_country(raw: str | None) -> str | None:
         return raw
     code = str(raw).strip().upper()
     return _ISO_TO_RUSSIAN.get(code, raw)
+
+
+def resolve_country_code(raw: str | None) -> int | None:
+    """
+    Return ISO 3166-1 numeric code for a country given either:
+      - ISO-2 code  ("SE"      → 752)
+      - Russian name ("Швеция" → 752)
+    Returns None if not found.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    # Try ISO-2 first (short string)
+    if len(s) <= 3:
+        numeric = _ISO_TO_NUMERIC.get(s.upper())
+        if numeric is not None:
+            return numeric
+    # Try Russian name (case-insensitive)
+    return _RUSSIAN_TO_NUMERIC.get(s.lower())
 
 
 def finalize_items(items: list[dict], currency_db: list[dict]) -> list[dict]:
@@ -101,11 +144,24 @@ def finalize_items(items: list[dict], currency_db: list[dict]) -> list[dict]:
             item["currency_name"] = cname or ccode
 
         # Map ISO country code → Russian name (e.g. "DE" → "Германия")
+        # and fill country_origin_code when missing/null
         raw_origin = item.get("country_origin")
         if raw_origin and len(str(raw_origin).strip()) <= 3:
             mapped = resolve_country(raw_origin)
             if mapped and mapped != raw_origin:
                 item["country_origin"] = mapped
+
+        # Fill numeric country code if null/missing — works for both ISO-2 and
+        # Russian names (covers the case where the model set "SE" but forgot the code,
+        # or already converted to "Швеция" without a numeric code)
+        existing_code = item.get("country_origin_code")
+        if existing_code is None or str(existing_code).strip().lower() in ("", "null", "none"):
+            resolved_code = resolve_country_code(raw_origin)
+            if resolved_code is None:
+                # raw_origin may already be a Russian name — try the (possibly mapped) value
+                resolved_code = resolve_country_code(item.get("country_origin"))
+            if resolved_code is not None:
+                item["country_origin_code"] = resolved_code
 
         # Ensure hs_code and suggestions
         if "hs_code" not in item:
